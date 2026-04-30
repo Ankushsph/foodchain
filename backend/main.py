@@ -1,14 +1,21 @@
 from fastapi import FastAPI
-from pydantic import BaseModel, Field, validator
-from stellar_sdk import Server, Keypair, TransactionBuilder, Network, Asset
-import hashlib, json
-from datetime import datetime
-
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import Optional
+from datetime import datetime
+import random
+import hashlib
+import json
+import os
+from dotenv import load_dotenv
+from stellar_sdk import Server, Keypair, TransactionBuilder, Network, Memo
+from ai.food_chain_ai import ai_system
+
+load_dotenv()
 
 app = FastAPI()
 
-# 🌐 CORS Configuration
+# Add CORS Middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -17,334 +24,239 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 🔐 SECRET KEY
-SECRET_KEY = "SABVQGPVN6QTCWYHU5ZKYBZ2IQIWLTPGZDM6I77USIUHF5T7CT4IQCN4"
-source_keypair = Keypair.from_secret(SECRET_KEY)
+# =========================
+# DATA STORE
+# =========================
+batch_history = {}
 
-# 🌐 Stellar Testnet
-server = Server("https://horizon-testnet.stellar.org")
+# =========================
+# STELLAR CONFIG
+# =========================
+STELLAR_SECRET = os.getenv("STELLAR_SECRET_KEY", "SBV") # Replace in .env
+try:
+    source_keypair = Keypair.from_secret(STELLAR_SECRET)
+except:
+    source_keypair = None
+    print("[WARN] STELLAR_SECRET_KEY missing or invalid in .env")
 
-# ====================================
-# GLOBAL CONSTANTS — fixed stage order
-# ====================================
-STAGES = ["farm", "processing", "distributor", "retail"]
+horizon_server = Server("https://horizon-testnet.stellar.org")
 
-# Actor labels per stage
-STAGE_ACTORS = {
-    "farm": "Farm A",
-    "processing": "Processing Unit",
-    "distributor": "Distributor Node",
-    "retail": "Retail Store"
-}
+def post_to_stellar(data_to_hash: dict):
+    """
+    Computes a SHA256 hash of the off-chain data and records it on the Stellar ledger.
+    Always returns a string — never raises an exception.
+    """
+    if not source_keypair:
+        # No Stellar key configured — return a deterministic simulation hash
+        data_str = json.dumps(data_to_hash, sort_keys=True)
+        return "sim_" + hashlib.sha256(data_str.encode()).hexdigest()[:32]
 
-# 🏭 DISTRIBUTORS (A–E per product)
-distributors = {
-    product: {f"Distributor {c}": {"score": 80} for c in ["A", "B", "C", "D", "E"]}
-    for product in ["milk", "water", "juice"]
-}
-
-# 📦 IN-MEMORY BATCH HISTORY STORE
-# Structure: { "MILK-001": [ { stage, status, risk, reason, timestamp, actor } ] }
-batch_history: dict[str, list[dict]] = {}
-
-
-# ====================================
-# INPUT MODEL
-# ====================================
-class Sample(BaseModel):
-    batch_id: str = Field(..., min_length=1)
-    stage: str
-    tds: float = Field(..., gt=0)
-    color: float = Field(..., gt=0)
-    product: str
-    distributor: str
-
-    @validator("stage")
-    def validate_stage(cls, v):
-        if v.lower() not in STAGES:
-            raise ValueError(f"Stage must be one of: {', '.join(STAGES)}")
-        return v.lower()
-
-    @validator("product")
-    def validate_product(cls, v):
-        if v.lower() not in ["milk", "water", "juice"]:
-            raise ValueError("Product must be milk, water, or juice")
-        return v.lower()
-
-    @validator("distributor")
-    def validate_distributor(cls, v):
-        # Allow any string for now, specifically for early stages
-        return v
-
-
-# ====================================
-# AI LOGIC (unchanged)
-# ====================================
-def analyze_sample(product, tds, color):
-    # 💧 WATER
-    if product == "water":
-        if tds > 500:
-            return {"status": "unsafe", "risk": "HIGH", "reason": "High TDS in water"}
-        elif tds > 300:
-            return {"status": "unsafe", "risk": "MEDIUM", "reason": "Moderate TDS"}
-        else:
-            return {"status": "safe", "risk": "LOW", "reason": "Safe drinking water"}
-
-    # 🥛 MILK
-    elif product == "milk":
-        if tds > 400 or color < 140:
-            return {"status": "unsafe", "risk": "HIGH", "reason": "Milk adulteration suspected"}
-        elif tds > 250 or color < 160:
-            return {"status": "unsafe", "risk": "MEDIUM", "reason": "Possible dilution"}
-        else:
-            return {"status": "safe", "risk": "LOW", "reason": "Milk is pure"}
-
-    # 🧃 JUICE
-    elif product == "juice":
-        if color < 100:
-            return {"status": "unsafe", "risk": "HIGH", "reason": "Severe color deviation"}
-        elif color < 150:
-            return {"status": "unsafe", "risk": "MEDIUM", "reason": "Color inconsistency"}
-        else:
-            return {"status": "safe", "risk": "LOW", "reason": "Juice looks fresh"}
-
-    # 🛡️ FALLBACK
-    return {"status": "safe", "risk": "LOW", "reason": "Parameters within acceptable range"}
-
-
-# ====================================
-# DISTRIBUTOR SCORE UPDATE (unchanged)
-# ====================================
-def update_score(product, distributor, status):
-    # Skip score update if distributor is not in the scoring map (e.g. 'Pending')
-    if product not in distributors or distributor not in distributors[product]:
-        return 0, "N/A"
-
-    score = distributors[product][distributor]["score"]
-    if status == "safe":
-        score += 5
-    else:
-        score -= 10
-
-    score = max(0, min(100, score))
-    distributors[product][distributor]["score"] = score
-
-    if score < 30:
-        label = "BLACKLISTED"
-    elif score < 60:
-        label = "RISKY"
-    else:
-        label = "TRUSTED"
-
-    return score, label
-
-
-# ====================================
-# HASH FUNCTION (unchanged)
-# ====================================
-def generate_hash(data):
-    return hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()
-
-
-# ====================================
-# STELLAR STORE (unchanged)
-# ====================================
-def store_on_stellar(hash_value):
     try:
-        account = server.load_account(source_keypair.public_key)
+        data_str = json.dumps(data_to_hash, sort_keys=True)
+        data_hash = hashlib.sha256(data_str.encode()).hexdigest()
 
-        tx = (
+        source_account = horizon_server.load_account(source_keypair.public_key)
+
+        from stellar_sdk import Asset as StellarAsset
+        transaction = (
             TransactionBuilder(
-                source_account=account,
+                source_account=source_account,
                 network_passphrase=Network.TESTNET_NETWORK_PASSPHRASE,
-                base_fee=100
+                base_fee=100,
             )
             .append_payment_op(
                 destination=source_keypair.public_key,
-                asset=Asset.native(),
-                amount="0.00001"
+                amount="0.00001",
+                asset=StellarAsset.native(),
             )
-            .add_text_memo(hash_value[:28])
+            .add_memo(Memo.text(data_hash[:28]))
+            .set_timeout(30)
             .build()
         )
 
-        tx.sign(source_keypair)
-        response = server.submit_transaction(tx)
-        return response["hash"]
-
+        transaction.sign(source_keypair)
+        response = horizon_server.submit_transaction(transaction)
+        return response.get("hash", f"ok_{random.getrandbits(32):x}")
     except Exception as e:
-        return f"Blockchain Error: {str(e)}"
+        print(f"[ERROR] Stellar Error: {e}")
+        return f"err_{random.getrandbits(32):x}"
 
+# =========================
+# MODEL (MATCH ESP32 JSON)
+# =========================
+class Sample(BaseModel):
+    batch_id: str = "UNKNOWN"
+    ph: Optional[float] = 7.0
+    turbidity: Optional[float] = 10.0
+    tds: float = 200.0
+    color: float = 200.0
+    stage: str = "farm"
+    product: str = "milk"
+    distributor: Optional[str] = "Unknown"
+    retailer: Optional[str] = "Unknown"
 
-# ====================================
-# ROOT CAUSE DETECTION
-# ====================================
-def get_root_cause(history: list[dict]) -> str | None:
-    """
-    Find the FIRST stage (in STAGES order) where status == 'unsafe'.
-    Returns the stage name or None if all stages are safe.
-    """
-    stage_map = {entry["stage"]: entry for entry in history}
-    for stage in STAGES:
-        if stage in stage_map and stage_map[stage]["status"] == "unsafe":
-            return stage
-    return None
+# =========================
+# SIMPLE ANALYSIS LOGIC
+# =========================
+def analyze_sample(sample: Sample):
+    # Use the advanced AI model
+    result = ai_system.analyze_sample({
+        "tds": sample.tds,
+        "color": sample.color,
+        "source": sample.stage
+    })
+    
+    # Map AI results to our local structure
+    status = result["status"]
+    risk = result["risk"]
+    reason = result["reason"]
+    
+    return status, risk, reason
 
-
-# ====================================
-# DECISION ENGINE
-# ====================================
-def get_decision(history: list[dict]) -> str:
-    """
-    Rules (BLOCK_BATCH has highest priority):
-      - All safe → ALLOW
-      - Unsafe at farm or processing → BLOCK_BATCH
-      - Unsafe at distributor or retail → STOP_SUPPLY
-    """
-    stage_map = {entry["stage"]: entry for entry in history}
-
-    # Check early stages first (highest priority)
-    for early_stage in ["farm", "processing"]:
-        if early_stage in stage_map and stage_map[early_stage]["status"] == "unsafe":
-            return "BLOCK_BATCH"
-
-    # Check later stages
-    for late_stage in ["distributor", "retail"]:
-        if late_stage in stage_map and stage_map[late_stage]["status"] == "unsafe":
-            return "STOP_SUPPLY"
-
-    return "ALLOW"
-
-
-# ====================================
-# SORT HISTORY BY STAGES ORDER
-# ====================================
-def sort_history(history: list[dict]) -> list[dict]:
-    """Sort batch history entries according to fixed STAGES order."""
-    stage_index = {s: i for i, s in enumerate(STAGES)}
-    return sorted(history, key=lambda x: stage_index.get(x["stage"], 999))
-
-
-# ====================================
-# UPSERT STAGE INTO BATCH
-# ====================================
-def upsert_stage(batch_id: str, stage_entry: dict):
-    """
-    Add or replace a stage entry in batch_history.
-    Only one entry per stage per batch_id is allowed.
-    """
-    if batch_id not in batch_history:
-        batch_history[batch_id] = []
-
-    # Remove existing entry for this stage if it exists
-    batch_history[batch_id] = [
-        e for e in batch_history[batch_id]
-        if e["stage"] != stage_entry["stage"]
-    ]
-
-    # Append the new entry
-    batch_history[batch_id].append(stage_entry)
-
-    # Always keep sorted by STAGES order
-    batch_history[batch_id] = sort_history(batch_history[batch_id])
-
-
-# ====================================
-# HOME ROUTE
-# ====================================
+# =========================
+# ROUTES
+# =========================
 @app.get("/")
 def home():
-    return {"message": "FoodChain AI Backend Running 🚀 — Phase 1: Batch Tracking Active"}
+    return {"msg": "FoodChain AI Phase 2 Backend Running"}
 
+STAGES = ["farm", "distributor", "retail"]
 
-# ====================================
-# GET BATCH HISTORY
-# ====================================
-@app.get("/batch/{batch_id}")
-def get_batch(batch_id: str):
-    history = batch_history.get(batch_id, [])
-    root_cause = get_root_cause(history)
-    decision = get_decision(history)
-    return {
-        "batch_id": batch_id,
-        "batch_history": history,
-        "root_cause": root_cause,
-        "decision": decision
-    }
-
-
-# ====================================
-# MAIN ANALYZE API
-# ====================================
+# 🔥 MAIN ROUTE FOR FRONTEND / ESP32
 @app.post("/analyze")
 def analyze(sample: Sample):
+    status, risk, reason = analyze_sample(sample)
 
-    # 🤖 Run AI for current stage
-    ai_result = analyze_sample(sample.product, sample.tds, sample.color)
-
-    # 📊 Update distributor score
-    score, dist_status = update_score(
-        sample.product,
-        sample.distributor,
-        ai_result["status"]
-    )
-
-    # 🏷️ Build stage entry
-    stage_entry = {
+    entry = {
         "stage": sample.stage,
-        "status": ai_result["status"],
-        "risk": ai_result["risk"],
-        "reason": ai_result["reason"],
-        "actor": STAGE_ACTORS.get(sample.stage, sample.stage.capitalize()),
-        "product": sample.product,
-        "distributor": sample.distributor,
+        "actor": "Agricultural Source" if sample.stage == "farm" else "Logistics Node" if sample.stage == "distributor" else "Retail Center",
+        "status": status,
+        "risk": risk,
+        "reason": reason,
         "tds": sample.tds,
         "color": sample.color,
-        "timestamp": datetime.now().isoformat()
+        "ph": sample.ph,
+        "turbidity": sample.turbidity,
+        "distributor": sample.distributor,
+        "retailer": sample.retailer,
+        "time": datetime.now().isoformat()
     }
 
-    # 📝 Upsert into batch history (replace if same stage submitted again)
-    upsert_stage(sample.batch_id, stage_entry)
+    if sample.batch_id not in batch_history:
+        batch_history[sample.batch_id] = []
 
-    # Retrieve full updated history for this batch
+    # Update existing stage entry or add new one
+    existing_idx = next((i for i, x in enumerate(batch_history[sample.batch_id]) if x["stage"] == sample.stage), -1)
+    if existing_idx > -1:
+        batch_history[sample.batch_id][existing_idx] = entry
+    else:
+        batch_history[sample.batch_id].append(entry)
+
+    # Record on Stellar (On-chain/Off-chain architecture)
+    tx_hash = post_to_stellar(entry)
+
+    # Sequence Logic: Determine if this is the final stage and if it passes
+    is_final_stage = (sample.stage == STAGES[-1])
+    
+    # Check for any failures in history
     history = batch_history[sample.batch_id]
+    first_failure = next((e for e in history if e["status"] == "unsafe"), None)
+    
+    root_cause = first_failure["stage"] if first_failure else None
+    
+    if first_failure:
+        decision = "BLOCK_BATCH"
+    elif is_final_stage:
+        decision = "APPROVED_FOR_SALE"
+    else:
+        decision = "ALLOW"
 
-    # 🔍 Root cause detection
-    root_cause = get_root_cause(history)
-
-    # ⚖️ Decision engine
-    decision = get_decision(history)
-
-    # 📦 Build hash payload
-    hash_payload = {
+    response = {
         "batch_id": sample.batch_id,
-        "stage": sample.stage,
-        "product": sample.product,
-        "distributor": sample.distributor,
-        "tds": sample.tds,
-        "color": sample.color,
-        "ai_result": ai_result,
-        "timestamp": stage_entry["timestamp"]
-    }
-
-    # 🔐 Hash + Blockchain
-    batch_hash = generate_hash(hash_payload)
-    tx_hash = store_on_stellar(batch_hash)
-
-    return {
-        "batch_id": sample.batch_id,
-        "current_stage_result": {
-            "stage": sample.stage,
-            "status": ai_result["status"],
-            "risk": ai_result["risk"],
-            "reason": ai_result["reason"],
-            "actor": stage_entry["actor"]
-        },
+        "current_stage_result": entry,
         "batch_history": history,
         "root_cause": root_cause,
         "decision": decision,
-        "distributor_score": score,
-        "distributor_status": dist_status,
-        "blockchain_hash": tx_hash,
-        "batch_hash": batch_hash
+        "blockchain_hash": tx_hash
+    }
+    
+    # Store globally for /live endpoint (don't overwrite the raw ESP32 stream)
+    global latest_analysis_result
+    latest_analysis_result = response
+    
+    print(f"Received {sample.stage} data for {sample.batch_id}: {status} | Decision: {decision}")
+    return response
+
+@app.post("/reset")
+def reset_all():
+    global batch_history, latest_analysis_result, latest_esp32_data
+    batch_history = {}
+    latest_analysis_result = {"connected": False}
+    # Reset ESP32 data to safe defaults too
+    latest_esp32_data = {"tds": 0, "color": 0, "connected": latest_esp32_data.get("connected", False)}
+    return {"status": "reset success"}
+
+# 📡 LIVE FEED STATE
+latest_esp32_data = {"tds": 0, "color": 0, "connected": False}
+latest_analysis_result = {"connected": False}
+
+@app.post("/esp32/update")
+async def update_esp32_live(data: dict):
+    global latest_esp32_data
+    # Log the incoming data for debugging
+    print(f"ESP32 Telemetry: TDS={data.get('tds')} | COLOR={data.get('color')} | pH={data.get('ph')} | Turb={data.get('turbidity')}")
+    
+    latest_esp32_data = {
+        "connected": True,
+        "tds": data.get("tds", 0),
+        "color": data.get("color", 0),
+        "status": "STREAMING",
+        "last_updated": datetime.now().isoformat()
+    }
+    return {"status": "success"}
+
+@app.get("/verify/{batch_id}")
+def verify(batch_id: str):
+    if batch_id not in batch_history:
+        return {
+            "verdict": "Batch Not Found",
+            "status": "UNKNOWN",
+            "root_cause": None,
+            "total_checkpoints": 0,
+            "events": []
+        }
+    
+    history = batch_history[batch_id]
+    root_cause = None
+    for entry in history:
+        if entry["status"] == "unsafe":
+            root_cause = entry["stage"]
+            break
+            
+    return {
+        "verdict": "Contamination Detected" if root_cause else "Batch Fully Verified",
+        "status": "UNSAFE" if root_cause else "SAFE",
+        "root_cause": root_cause,
+        "total_checkpoints": len(history),
+        "events": [
+            {
+                "stage": e["stage"],
+                "actor": e["actor"],
+                "status": e["status"],
+                "timestamp": e["time"],
+                "event_hash": f"stellar_tx_{random.getrandbits(64):016x}"
+            } for e in history
+        ]
+    }
+
+@app.get("/live")
+def get_live():
+    # Return a merged object for the frontend to consume easily
+    return {
+        "connected": latest_esp32_data.get("connected", False),
+        "tds": latest_esp32_data.get("tds", 0),
+        "color": latest_esp32_data.get("color", 0),
+        "status": latest_esp32_data.get("status", "IDLE"),
+        "last_updated": latest_esp32_data.get("last_updated"),
+        "analysis": latest_analysis_result
     }

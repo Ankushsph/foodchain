@@ -1,20 +1,19 @@
 import { create } from 'zustand';
+import toast from 'react-hot-toast';
 
 // Fixed stage order — must match backend STAGES constant
-export const STAGES = ["farm", "processing", "distributor", "retail"];
+export const STAGES = ["farm", "distributor", "retail"];
 
 export const STAGE_LABELS = {
   farm: "Farm",
-  processing: "Processing",
   distributor: "Distributor",
   retail: "Retail Store",
 };
 
 export const STAGE_ACTORS = {
-  farm: "Farm A",
-  processing: "Processing Unit",
-  distributor: "Distributor Node",
-  retail: "Retail Store",
+  farm: "Agricultural Source",
+  distributor: "Logistics Node",
+  retail: "Retail Center",
 };
 
 // TDS / Color safety thresholds per product (for sensor card limit display)
@@ -70,10 +69,13 @@ const useStore = create((set, get) => ({
     confidence: 0,
   },
 
-  // ── Distributor Info ─────────────────────────────────────────
   distributorInfo: {
     name: "",
     score: 0,
+    status: "",
+  },
+  retailerInfo: {
+    name: "",
     status: "",
   },
 
@@ -92,6 +94,7 @@ const useStore = create((set, get) => ({
     isConnected: false,
     batchId: "N/A",
     txHash: "N/A",
+    event: null,
     verified: false,
   },
 
@@ -99,49 +102,152 @@ const useStore = create((set, get) => ({
   alerts: [],
   addAlert: (alert) => set((state) => ({ alerts: [alert, ...state.alerts] })),
 
+  // ── ESP32 Live Feed ──────────────────────────────────────────
+  esp32Live: {
+    connected: false,
+    tds: 0,
+    color: 0,
+    status: "IDLE",
+    time: null,
+  },
+  _pollInterval: null,
+
+  startEsp32Polling: () => {
+    // Clear any existing interval
+    const existing = useStore.getState()._pollInterval;
+    if (existing) clearInterval(existing);
+
+    const poll = async () => {
+      try {
+        const res = await fetch("http://127.0.0.1:8000/live");
+        const json = await res.json();
+        
+        if (json.connected) {
+          set({
+            esp32Live: {
+              connected: true,
+              tds: json.tds,
+              color: json.color,
+              status: json.status,
+              time: json.last_updated,
+            }
+          });
+        }
+
+        // 🔥 AUTOMATIC PIPELINE SYNC
+        if (json.analysis && json.analysis.batch_id) {
+          const fullBatch = json.analysis;
+          const batchHistoryRaw = fullBatch.batch_history;
+          const rootCause = fullBatch.root_cause;
+          const decision = fullBatch.decision;
+          
+          const historyMap = {};
+          batchHistoryRaw.forEach((entry) => {
+            if (entry && entry.stage) historyMap[entry.stage] = entry;
+          });
+
+          const rootCauseIndex = rootCause ? STAGES.indexOf(rootCause) : -1;
+
+          const newSupplyChain = STAGES.map((stage, idx) => {
+            const entry = historyMap[stage];
+            const isRoot = stage === rootCause;
+            const isAfter = rootCauseIndex !== -1 && idx > rootCauseIndex && decision !== "ALLOW";
+
+            if (entry) {
+              return {
+                id: stage,
+                name: STAGE_LABELS[stage],
+                actor: entry.actor || STAGE_ACTORS[stage],
+                status: isRoot ? "unsafe" : isAfter ? "blocked" : entry.status,
+                risk: entry.risk,
+                reason: entry.reason,
+                tds: entry.tds,
+                color: entry.color,
+                isRootCause: isRoot,
+              };
+            } else {
+              return {
+                id: stage,
+                name: STAGE_LABELS[stage],
+                actor: STAGE_ACTORS[stage],
+                status: isAfter ? "blocked" : "pending",
+                risk: "NONE",
+                reason: "",
+                tds: 0,
+                color: 0,
+                isRootCause: false,
+              };
+            }
+          });
+
+          set({
+            supplyChain: newSupplyChain,
+            batchHistory: batchHistoryRaw,
+            rootCause,
+            decision,
+            batchId: fullBatch.batch_id,
+            hasData: true,
+            blockchain: {
+              ...get().blockchain,
+              txHash: fullBatch.blockchain_hash || "N/A",
+              batchId: fullBatch.batch_id,
+            }
+          });
+        }
+      } catch (err) {
+        console.error("Polling error:", err);
+        set((s) => ({ esp32Live: { ...s.esp32Live, connected: false } }));
+      }
+    };
+
+    poll(); // immediate first call
+    const id = setInterval(poll, 3000); // poll every 3s
+    set({ _pollInterval: id });
+  },
+
   // ── Main API Call ─────────────────────────────────────────────
   fetchAiAnalysis: async (inputData) => {
     // Only mark isAnalyzing — do NOT reset hasData (keeps previous pipeline visible)
     set({ isAnalyzing: true });
     try {
-      const response = await fetch("http://127.0.0.1:8001/analyze", {
+      const response = await fetch("http://127.0.0.1:8000/analyze", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(inputData),
       });
+      
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({}));
+        throw new Error(errorData.detail?.[0]?.msg || errorData.message || "Backend Analysis Failed");
+      }
+
       const data = await response.json();
 
-      if (data.current_stage_result) {
+      if (data && data.current_stage_result) {
         // Always uppercase for consistent comparisons
         const rawStatus = data.current_stage_result.status || "safe";
-        const aiStatus = rawStatus.toUpperCase(); // "SAFE" | "UNSAFE"
+        const aiStatus = rawStatus.toUpperCase();
 
-        const rootCause = data.root_cause || null;         // e.g. "distributor" or null
+        const rootCause = data.root_cause || null;
         const decision = data.decision || "ALLOW";
         const batchHistoryRaw = data.batch_history || [];
 
-        // Build lookup map: stage → entry
         const historyMap = {};
         batchHistoryRaw.forEach((entry) => {
-          historyMap[entry.stage] = entry;
+          if (entry && entry.stage) historyMap[entry.stage] = entry;
         });
 
         const rootCauseIndex = rootCause ? STAGES.indexOf(rootCause) : -1;
-
-        // ── Derive root cause's reason for alert messages ─────────
         const rootCauseEntry = rootCause ? historyMap[rootCause] : null;
-        const rootCauseReason = rootCauseEntry
-          ? rootCauseEntry.reason
-          : data.current_stage_result.reason || "";
 
-        // ── Build 4-stage supplyChain ─────────────────────────────
-        // Rules (in priority order):
-        //   1. Stage has been submitted AND is the root cause → "unsafe"
-        //   2. Stage has been submitted AND is AFTER root cause → "blocked"
-        //      (they were submitted but supply is already halted — override to blocked)
-        //   3. Stage has been submitted → use its actual status
-        //   4. Stage NOT submitted AND is AFTER root cause → "blocked"
-        //   5. Stage NOT submitted → "pending"
+        let alertMsg = "Batch cleared for next stage";
+        if (decision === "BLOCK_BATCH") alertMsg = "Batch blocked due to contamination at early stage";
+        else if (decision === "STOP_SUPPLY") alertMsg = `Supply halted at ${rootCause?.toUpperCase()} stage`;
+        else if (decision === "REJECT_AT_RETAIL") alertMsg = "Batch rejected at retail gate";
+        else if (decision === "APPROVED_FOR_SALE") alertMsg = "Batch fully verified for distribution";
+
+        const rootCauseReason = rootCauseEntry ? rootCauseEntry.reason : alertMsg;
+
         const newSupplyChain = STAGES.map((stage, idx) => {
           const entry = historyMap[stage];
           const isRoot = stage === rootCause;
@@ -151,8 +257,7 @@ const useStore = create((set, get) => ({
             return {
               id: stage,
               name: STAGE_LABELS[stage],
-              actor: entry.actor || STAGE_ACTORS[stage],
-              // Root cause → "unsafe", stages after root cause → "blocked", otherwise actual
+              actor: (stage === 'distributor' ? entry.distributor : stage === 'retail' ? entry.retailer : null) || entry.actor || STAGE_ACTORS[stage],
               status: isRoot ? "unsafe" : isAfter ? "blocked" : entry.status,
               risk: entry.risk,
               reason: entry.reason,
@@ -176,22 +281,26 @@ const useStore = create((set, get) => ({
         });
 
         set({
-          // Current stage AI result — status always UPPERCASE
           aiResult: {
             status: aiStatus,
             risk: data.current_stage_result.risk || "LOW",
             reason: data.current_stage_result.reason || "",
-            confidence: 95,
+            confidence: data.current_stage_result.confidence || 95,
           },
           distributorInfo: {
-            name: inputData.distributor,
-            score: data.distributor_score,
-            status: data.distributor_status,
+            name: historyMap['distributor']?.distributor || historyMap['distributor']?.actor || "",
+            score: data.distributor_score || 0,
+            status: historyMap['distributor']?.status || "",
+          },
+          retailerInfo: {
+            name: historyMap['retail']?.retailer || historyMap['retail']?.actor || "",
+            status: historyMap['retail']?.status || "",
           },
           blockchain: {
             isConnected: true,
-            batchId: data.batch_id,
-            txHash: data.blockchain_hash,
+            batchId: data.batch_id || "N/A",
+            txHash: data.blockchain?.txHash || data.blockchain_hash || "N/A",
+            event: data.blockchain?.event || null,
             verified: true,
           },
           batchHistory: batchHistoryRaw,
@@ -200,7 +309,6 @@ const useStore = create((set, get) => ({
           decision,
           supplyChain: newSupplyChain,
           hasData: true,
-          // Store the last submitted stage's product for limit lookups
           sensorData: {
             pH: 7.2,
             turbidity: 2.1,
@@ -210,11 +318,29 @@ const useStore = create((set, get) => ({
             lastUpdated: new Date().toISOString(),
           },
         });
+        toast.success(`${STAGE_LABELS[data.current_stage_result.stage] || 'Stage'} Analyzed`);
+      } else {
+        throw new Error("Invalid response format from AI backend");
       }
     } catch (error) {
       console.error("Failed to fetch AI analysis:", error);
+      toast.error(error.message || "Failed to analyze batch");
     } finally {
       set({ isAnalyzing: false });
+    }
+  },
+
+  // ⛓️ Dispute Verification Action
+  verifyBatch: async (batchId) => {
+    try {
+      const response = await fetch(`http://127.0.0.1:8000/verify/${batchId}`);
+      if (!response.ok) throw new Error("Verification failed");
+      const data = await response.json();
+      return data;
+    } catch (error) {
+      console.error("Verification failed:", error);
+      toast.error("Batch verification failed");
+      return null;
     }
   },
 }));

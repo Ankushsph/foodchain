@@ -1,7 +1,7 @@
 import axios from 'axios';
 
 // Mock API base URL - replace with actual backend URL later
-const API_BASE_URL = 'http://localhost:8000/api';
+const API_BASE_URL = 'http://localhost:8000';
 
 const apiClient = axios.create({
   baseURL: API_BASE_URL,
@@ -12,17 +12,13 @@ const apiClient = axios.create({
 
 export const api = {
   postSensorData: async (data) => {
-    // return apiClient.post('/sensor-data', data);
-    console.log('Mock post sensor data:', data);
-    return Promise.resolve({ data: { success: true } });
+    return apiClient.post('/analyze', data);
   },
   postAnalyze: async (data) => {
     return apiClient.post('/analyze', data);
   },
   getBatch: async (id) => {
-    // return apiClient.get(`/batch/${id}`);
-    console.log('Mock get batch:', id);
-    return Promise.resolve({ data: { id, status: 'Verified' } });
+    return apiClient.get(`/batch/${id}`);
   },
   getAlerts: async () => {
     // return apiClient.get('/alerts');

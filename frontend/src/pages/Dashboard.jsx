@@ -1,421 +1,641 @@
-import React, { useEffect, useState, useMemo } from 'react';
+import React, { useEffect, useState, useMemo, useRef } from 'react';
 import { motion, useMotionValue, useTransform, animate, AnimatePresence } from 'framer-motion';
-import { ShieldCheck, Activity, BrainCircuit, AlertTriangle, Search, MapPin, Package, Truck, Hash, CheckCircle2, XCircle, Lock, ChevronRight } from 'lucide-react';
+import {
+  ShieldCheck, Activity, BrainCircuit, AlertTriangle, Search,
+  CheckCircle2, XCircle, Clock, Ban, Leaf, Truck, Store, ChevronRight, Zap, RefreshCw
+} from 'lucide-react';
 import useStore, { STAGES, STAGE_LABELS, PRODUCT_LIMITS } from '../store/useStore';
 import { GlassCard, cn } from '../components/ui/GlassCard';
 import { Badge } from '../components/ui/Badge';
 import { Button } from '../components/ui/Button';
 
-const AnimatedNumber = ({ value }) => {
-  const count = useMotionValue(0);
-  const rounded = useTransform(count, (latest) => Math.round(latest));
-  const [displayValue, setDisplayValue] = useState(0);
-  useEffect(() => {
-    const anim = animate(count, value, { duration: 1.5 });
-    rounded.onChange(v => setDisplayValue(v));
-    return anim.stop;
-  }, [value]);
-  return <motion.span>{displayValue}</motion.span>;
-};
+const STAGE_ICONS = { farm: Leaf, distributor: Truck, retail: Store };
 
-const STAGE_ICONS_MAP = { farm: '🌾', processing: '🏭', distributor: '🚚', retail: '🏪' };
+// Delay helper
+const sleep = (ms) => new Promise(res => setTimeout(res, ms));
 
 export const Dashboard = () => {
   const {
     fetchAiAnalysis, isAnalyzing, hasData,
-    batchId, selectedProduct, selectedDistributor, batchHistory,
-    rootCause, rootCauseReason, decision, aiResult, distributorInfo,
-    inputTds, inputColor, setInputs,
+    batchId, selectedProduct, selectedDistributor, selectedRetailer,
+    batchHistory, rootCause, decision, aiResult, distributorInfo, retailerInfo,
+    inputTds, inputColor, setInputs, selectedStage, esp32Live, startEsp32Polling
   } = useStore();
 
+  useEffect(() => {
+    startEsp32Polling();
+  }, [startEsp32Polling]);
+
   const [error, setError] = useState('');
-  // Per-stage TDS/Color local inputs
-  const [stageInputs, setStageInputs] = useState({ farm: { tds: '', color: '' }, processing: { tds: '', color: '' }, distributor: { tds: '', color: '' }, retail: { tds: '', color: '' } });
+  const [runningPipeline, setRunningPipeline] = useState(false);
+  const [currentRunStage, setCurrentRunStage] = useState(null); // which stage is actively being analyzed
   const [batchLocked, setBatchLocked] = useState(false);
 
-  // Build stage result map from batchHistory
+  // Single-form inputs for the whole batch
+  const [form, setForm] = useState({
+    tds: '', color: '',
+    distributor: '', distTds: '', distColor: '',
+    retailer: '', retailTds: '', retailColor: ''
+  });
+
+  const updateForm = (field, val) => setForm(prev => ({ ...prev, [field]: val }));
+
   const stageResults = useMemo(() => {
     const map = {};
     batchHistory.forEach(e => { map[e.stage] = e; });
     return map;
   }, [batchHistory]);
 
-  // Determine active input stage (next stage to submit)
-  const activeInputStage = useMemo(() => {
-    if (decision && decision !== 'ALLOW') return null; // flow stopped
-    for (const s of STAGES) {
-      if (!stageResults[s]) return s;
-    }
-    return null; // all 4 done
-  }, [stageResults, decision]);
-
-  // Which stages are visible: all stages up to and including activeInputStage
-  const visibleStages = useMemo(() => {
-    const activeIdx = activeInputStage ? STAGES.indexOf(activeInputStage) : STAGES.length - 1;
-    // If flow stopped, show up to root cause only
-    if (decision && decision !== 'ALLOW' && rootCause) {
-      const rcIdx = STAGES.indexOf(rootCause);
-      return STAGES.slice(0, rcIdx + 1);
-    }
-    return STAGES.slice(0, activeIdx + 1);
-  }, [activeInputStage, decision, rootCause]);
-
+  const limits = PRODUCT_LIMITS[selectedProduct] || PRODUCT_LIMITS.default;
   const batchIsUnsafe = hasData && decision && decision !== 'ALLOW';
   const glow = !hasData ? '#4b5563' : batchIsUnsafe ? '#ff3b3b' : '#00ff9f';
-  const cardBorder = !hasData ? 'border-white/10' : batchIsUnsafe ? 'border-[#ff3b3b]/50' : 'border-[#00ff9f]/40';
+  const isCurSafe = aiResult.status === 'SAFE';
 
-  const limits = PRODUCT_LIMITS[selectedProduct] || PRODUCT_LIMITS.default;
+  const nextStage = useMemo(() => {
+    if (!stageResults['farm']) return 'farm';
+    if (stageResults['farm'].status === 'safe' && !stageResults['distributor']) return 'distributor';
+    if (stageResults['distributor']?.status === 'safe' && !stageResults['retail']) return 'retail';
+    return null;
+  }, [stageResults]);
 
-  const handleSubmitStage = async (stage) => {
-    const tds = stageInputs[stage]?.tds;
-    const color = stageInputs[stage]?.color;
-    
-    // Validate required fields
-    const isDistributorStage = stage === 'distributor';
-    const hasDistributor = isDistributorStage ? !!selectedDistributor : true;
+  // ── RUN STAGE ANALYSIS ───────────────────────────────────────────────────
+  const handleAnalyzeStage = async (stage) => {
+    const finalBatchId = batchId || `BATCH-${Date.now()}`;
+    const finalProduct = selectedProduct || 'milk';
 
-    if (!batchId || !selectedProduct || !hasDistributor || !tds || !color) {
-      setError(`Please fill in all required fields for ${STAGE_LABELS[stage]} analysis`);
-      setTimeout(() => setError(''), 3000);
-      return;
-    }
+    // Pick values based on stage
+    const finalTds = (stage === 'farm' ? form.tds : stage === 'distributor' ? form.distTds : form.retailTds) || '220';
+    const finalColor = (stage === 'farm' ? form.color : stage === 'distributor' ? form.distColor : form.retailColor) || '200';
+    const finalDist = form.distributor || 'Distributor A';
+    const finalRet = form.retailer || 'Retail Center 1';
+
     setError('');
-    setBatchLocked(true);
-    // sync stage inputs to store for sensor card display
-    setInputs({ 
-      selectedStage: stage, 
-      inputTds: tds, 
-      inputColor: color,
-      // If not distributor stage and distributor not set, send a placeholder
-      selectedDistributor: isDistributorStage ? selectedDistributor : (selectedDistributor || "Initial Provider")
+    setRunningPipeline(true);
+    setCurrentRunStage(stage);
+
+    // Sync store
+    setInputs({
+      batchId: finalBatchId,
+      selectedProduct: finalProduct,
+      selectedDistributor: finalDist,
+      selectedRetailer: finalRet,
+      selectedStage: stage,
+      inputTds: finalTds,
+      inputColor: finalColor,
     });
-    await fetchAiAnalysis({ 
-      batch_id: batchId, 
-      stage, 
-      tds: Number(tds), 
-      color: Number(color), 
-      product: selectedProduct, 
-      distributor: isDistributorStage ? selectedDistributor : (selectedDistributor || "Initial Provider")
-    });
+
+    try {
+      await fetchAiAnalysis({
+        batch_id: finalBatchId,
+        stage,
+        tds: Number(finalTds),
+        color: Number(finalColor),
+        product: finalProduct,
+        distributor: finalDist,
+        retailer: finalRet
+      });
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setRunningPipeline(false);
+      setCurrentRunStage(null);
+    }
   };
 
-  const updateStageInput = (stage, field, val) => {
-    setStageInputs(prev => ({ ...prev, [stage]: { ...prev[stage], [field]: val } }));
+  const syncWithEsp32 = (stage) => {
+    if (!esp32Live.connected) return;
+    if (stage === 'farm') {
+      setForm(prev => ({ ...prev, tds: esp32Live.tds, color: esp32Live.color }));
+    } else if (stage === 'distributor') {
+      setForm(prev => ({ ...prev, distTds: esp32Live.tds, distColor: esp32Live.color }));
+    } else if (stage === 'retail') {
+      setForm(prev => ({ ...prev, retailTds: esp32Live.tds, retailColor: esp32Live.color }));
+    }
+  };
+
+  const handleReset = async () => {
+    setBatchLocked(false);
+    setRunningPipeline(false);
+    setCurrentRunStage(null);
+    setForm({
+      tds: '', color: '',
+      distributor: '', distTds: '', distColor: '',
+      retailer: '', retailTds: '', retailColor: ''
+    });
+
+    try {
+      await fetch("http://127.0.0.1:8000/reset", { method: "POST" });
+    } catch (e) {
+      console.error("Failed to reset backend:", e);
+    }
+
+    // Full reset via store defaults
+    useStore.setState({
+      hasData: false, batchId: '', batchHistory: [], rootCause: null, decision: null,
+      rootCauseReason: '', selectedStage: '', inputTds: '', inputColor: '',
+      selectedProduct: '', selectedDistributor: '', selectedRetailer: '',
+      aiResult: { status: 'IDLE', risk: 'NONE', reason: '', confidence: 0 },
+      distributorInfo: { name: '', score: 0, status: '' },
+      retailerInfo: { name: '', status: '' },
+      blockchain: { isConnected: false, batchId: 'N/A', txHash: 'N/A', event: null, verified: false },
+      supplyChain: STAGES.map(s => ({
+        id: s, name: STAGE_LABELS[s], actor: '', status: 'pending',
+        risk: 'NONE', reason: '', tds: 0, color: 0, isRootCause: false,
+      })),
+    });
   };
 
   const tdsVal = hasData ? Number(inputTds) : 0;
   const colorVal = hasData ? Number(inputColor) : 0;
+
   const tdsOver = hasData && tdsVal > limits.tds;
   const colorOver = hasData && colorVal < limits.color;
-  const isCurSafe = aiResult.status === 'SAFE';
-  const glow2 = isCurSafe ? '#00ff9f' : '#ff3b3b';
 
   return (
     <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 space-y-10">
 
-      {/* ── BATCH SETUP CARD (always visible, locks after first submit) ── */}
+      {/* ── ALERT BANNER ── */}
+      <AnimatePresence>
+        {batchIsUnsafe && (
+          <motion.div initial={{ opacity: 0, y: -20 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }} className="flex justify-center">
+            <div className="w-full max-w-5xl px-8 py-6 rounded-2xl bg-[#ff3b3b]/10 border-2 border-[#ff3b3b]/40 shadow-[0_0_50px_rgba(255,59,59,0.2)] flex items-center justify-center gap-6 text-center">
+              <AlertTriangle className="w-10 h-10 text-[#ff3b3b] animate-pulse" />
+              <h2 className="text-3xl font-black text-[#ff3b3b] uppercase tracking-tighter italic">
+                {decision === 'BLOCK_BATCH' ? '🛑 Batch Blocked at ' : '🚨 Contamination at '}
+                <span className="text-white">{rootCause?.toUpperCase()}</span>
+              </h2>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* ── REAL-TIME ESP32 TELEMETRY ── */}
       <div className="flex justify-center">
-        <GlassCard className="w-full max-w-5xl border-[#00ff9f]/20 bg-[#00ff9f]/5 shadow-[0_0_40px_rgba(0,255,159,0.05)]">
-          <div className="flex flex-col gap-6 p-6">
-            <div className="flex items-center gap-5">
-              <div className="p-4 bg-[#00ff9f]/10 rounded-2xl border border-[#00ff9f]/20">
-                <BrainCircuit className="w-8 h-8 text-[#00ff9f]" />
+        <GlassCard className="w-full max-w-5xl bg-black/40 border-white/5 p-4 flex items-center justify-between overflow-hidden relative">
+          <div className="flex items-center gap-6">
+            <div className={cn(
+              "w-12 h-12 rounded-2xl flex items-center justify-center border-2",
+              esp32Live.connected ? "border-[#00ff9f]/30 bg-[#00ff9f]/5 text-[#00ff9f]" : "border-gray-800 text-gray-700"
+            )}>
+              <RefreshCw className={cn("w-6 h-6", esp32Live.connected && "animate-spin-slow")} />
+            </div>
+            <div>
+              <div className="flex items-center gap-2">
+                <h4 className="text-xs font-black text-white uppercase tracking-widest">Live ESP32 Stream</h4>
+                <div className={cn("w-1.5 h-1.5 rounded-full", esp32Live.connected ? "bg-[#00ff9f] animate-pulse" : "bg-gray-800")} />
               </div>
-              <div>
-                <h3 className="text-xl font-black text-white uppercase tracking-tighter">Batch Configuration</h3>
-                <p className="text-sm text-gray-400">Set once — submit each stage sequentially using the same Batch ID</p>
+              <p className="text-[10px] text-gray-500 font-bold uppercase">
+                {esp32Live.connected ? `Receiving: ${esp32Live.tds} PPM | ${esp32Live.color} COLOR` : "Hardware Offline — Waiting for sensor data"}
+              </p>
+            </div>
+          </div>
+
+          {esp32Live.connected && (
+            <div className="flex gap-4">
+              <div className="text-right">
+                <p className="text-[8px] text-gray-600 font-black uppercase">TDS LEVEL</p>
+                <p className="text-xl font-black text-[#00ff9f] italic">{esp32Live.tds}</p>
               </div>
-              {batchLocked && (
-                <div className="ml-auto flex items-center gap-2 px-3 py-1 rounded-full bg-[#00ff9f]/10 border border-[#00ff9f]/20">
-                  <Lock className="w-3 h-3 text-[#00ff9f]" />
-                  <span className="text-[9px] font-black text-[#00ff9f] uppercase tracking-widest">Locked</span>
+              <div className="w-px h-8 bg-white/10" />
+              <div className="text-right">
+                <p className="text-[8px] text-gray-600 font-black uppercase">COLOR IDX</p>
+                <p className="text-xl font-black text-[#00d1ff] italic">{esp32Live.color}</p>
+              </div>
+            </div>
+          )}
+        </GlassCard>
+      </div>
+
+      {/* ── BATCH CONFIG + SENSOR INPUTS ── */}
+      <div className="flex justify-center">
+        <GlassCard className="w-full max-w-5xl border-[#00ff9f]/20 bg-[#00ff9f]/5 p-6 space-y-6">
+          <div className="flex items-center gap-4">
+            <BrainCircuit className="w-8 h-8 text-[#00ff9f]" />
+            <div>
+              <h3 className="text-lg font-black text-white uppercase tracking-tighter">Batch Sensor Input</h3>
+              <p className="text-[10px] text-gray-500 uppercase font-bold">Progressive multi-node verification enabled</p>
+            </div>
+            {hasData && (
+              <div className="ml-auto flex gap-2">
+                <Badge variant="outline" className="text-[#00ff9f] border-[#00ff9f]/30 font-black italic">ACTIVE BATCH</Badge>
+                <button onClick={handleReset}
+                  className="text-[9px] font-black uppercase text-gray-500 border border-white/10 px-3 py-1 rounded-lg hover:text-white hover:border-white/30 transition-all">
+                  Reset
+                </button>
+              </div>
+            )}
+          </div>
+
+          {/* Row 1: Core Identification (Always Visible) */}
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div className="flex flex-col gap-1">
+              <label className="text-[9px] uppercase font-black text-gray-500 ml-1">Batch Tracking ID</label>
+              <input type="text" value={batchId} onChange={e => setInputs({ batchId: e.target.value })}
+                disabled={stageResults['farm']}
+                className="bg-black/60 border border-white/10 rounded-xl px-4 py-2.5 text-white font-bold outline-none focus:border-[#00ff9f]/50 transition-colors placeholder:text-gray-700"
+                placeholder="e.g. BATCH-772" />
+            </div>
+            <div className="flex flex-col gap-1">
+              <label className="text-[9px] uppercase font-black text-gray-500 ml-1">Product Type</label>
+              <select value={selectedProduct} onChange={e => setInputs({ selectedProduct: e.target.value })}
+                disabled={stageResults['farm']}
+                className="bg-black/60 border border-white/10 rounded-xl px-4 py-2.5 text-white font-bold outline-none focus:border-[#00ff9f]/50 transition-colors appearance-none cursor-pointer">
+                <option value="">Select Product...</option>
+                <option value="milk">🥛 Fresh Milk</option>
+                <option value="water">💧 Mineral Water</option>
+                <option value="juice">🧃 Fruit Juice</option>
+              </select>
+            </div>
+          </div>
+
+          {/* Row 2: Initial Sensor Values (Always Visible) */}
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-6 bg-white/[0.02] p-6 rounded-2xl border border-white/5 relative group">
+            <div className="space-y-4">
+              <div className="flex items-center gap-2">
+                <Leaf className="w-4 h-4 text-[#00ff9f]" />
+                <h4 className="text-[10px] font-black text-white uppercase tracking-widest">Farm Analysis Node</h4>
+              </div>
+              <div className="grid grid-cols-2 gap-4">
+                <div className="flex flex-col gap-1">
+                  <label className="text-[9px] uppercase font-black text-gray-500 ml-1">Farm TDS (ppm)</label>
+                  <input type="number" value={form.tds} onChange={e => updateForm('tds', e.target.value)}
+                    className="bg-black/60 border border-white/10 rounded-xl px-4 py-2.5 text-white font-bold outline-none focus:border-[#00ff9f]/40"
+                    placeholder="e.g. 220" />
                 </div>
-              )}
-            </div>
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-              <div className="flex flex-col gap-2">
-                <label className="text-[10px] uppercase font-black text-[#00ff9f]/70 ml-1 flex items-center gap-2">
-                  <Hash className="w-3 h-3" /> Batch ID
-                </label>
-                <input type="text" value={batchId} onChange={e => setInputs({ batchId: e.target.value })} disabled={batchLocked}
-                  className={cn("bg-black/60 border border-white/10 rounded-xl px-4 py-3 text-white font-bold focus:border-[#00ff9f]/50 outline-none", batchLocked && "opacity-60 cursor-not-allowed")}
-                  placeholder="e.g. MILK-001" />
-              </div>
-              <div className="flex flex-col gap-2">
-                <label className="text-[10px] uppercase font-black text-[#00ff9f]/70 ml-1 flex items-center gap-2">
-                  <Package className="w-3 h-3" /> Product
-                </label>
-                <select value={selectedProduct} onChange={e => setInputs({ selectedProduct: e.target.value })} disabled={batchLocked}
-                  className={cn("bg-black/60 border border-white/10 rounded-xl px-4 py-3 text-white font-bold focus:border-[#00ff9f]/50 outline-none appearance-none cursor-pointer", batchLocked && "opacity-60 cursor-not-allowed")}>
-                  <option value="" disabled className="bg-black">Choose Product</option>
-                  <option value="milk" className="bg-black">Milk</option>
-                  <option value="water" className="bg-black">Water</option>
-                  <option value="juice" className="bg-black">Juice</option>
-                </select>
+                <div className="flex flex-col gap-1">
+                  <label className="text-[9px] uppercase font-black text-gray-500 ml-1">Farm Color Index</label>
+                  <input type="number" value={form.color} onChange={e => updateForm('color', e.target.value)}
+                    className="bg-black/60 border border-white/10 rounded-xl px-4 py-2.5 text-white font-bold outline-none focus:border-[#00ff9f]/40"
+                    placeholder="e.g. 200" />
+                </div>
               </div>
             </div>
+
+            <div className="flex flex-col justify-center items-center gap-4 border-l border-white/5 pl-6">
+              <div className="text-center">
+                <p className="text-[8px] font-black text-gray-600 uppercase tracking-widest mb-2">Live ESP32 Feed (Farm)</p>
+                <div className="flex gap-4">
+                  <div className="bg-black/40 px-4 py-2 rounded-xl border border-white/5">
+                    <p className="text-[10px] font-black text-[#00ff9f] italic">{esp32Live.connected ? esp32Live.tds : '--'}</p>
+                    <p className="text-[7px] text-gray-700 font-bold">TDS</p>
+                  </div>
+                  <div className="bg-black/40 px-4 py-2 rounded-xl border border-white/5">
+                    <p className="text-[10px] font-black text-[#00d1ff] italic">{esp32Live.connected ? esp32Live.color : '--'}</p>
+                    <p className="text-[7px] text-gray-700 font-bold">COLOR</p>
+                  </div>
+                </div>
+              </div>
+              <div className="flex gap-2">
+                <button onClick={() => syncWithEsp32('farm')} disabled={!esp32Live.connected}
+                  className="px-4 py-2 rounded-xl border border-[#00ff9f]/20 text-[9px] font-black text-[#00ff9f] uppercase hover:bg-[#00ff9f]/10 transition-all disabled:opacity-30 flex items-center gap-2">
+                  <RefreshCw className="w-3 h-3" /> Sync Data
+                </button>
+                <button onClick={() => handleAnalyzeStage('farm')} disabled={runningPipeline}
+                  className="px-4 py-2 rounded-xl font-black uppercase text-[9px] bg-[#00ff9f]/20 text-[#00ff9f] border border-[#00ff9f]/30 hover:bg-[#00ff9f] hover:text-black transition-all flex items-center gap-2">
+                  <Zap className="w-3 h-3" /> Analyze
+                </button>
+              </div>
+            </div>
+            {stageResults['farm'] && (
+              <div className="absolute -right-2 -top-2 w-6 h-6 rounded-full bg-[#00ff9f] flex items-center justify-center shadow-[0_0_15px_rgba(0,255,159,0.5)]">
+                <CheckCircle2 className="w-4 h-4 text-black" />
+              </div>
+            )}
+          </div>
+
+          {/* Row 3: Conditional Distributor (after Farm) */}
+          <AnimatePresence>
+            {stageResults['farm']?.status === 'safe' && (
+              <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }}
+                className="grid grid-cols-1 md:grid-cols-2 gap-6 bg-white/[0.02] p-6 rounded-2xl border border-white/5 relative group">
+                <div className="space-y-4">
+                  <div className="flex items-center gap-2">
+                    <Truck className="w-4 h-4 text-[#00ff9f]" />
+                    <h4 className="text-[10px] font-black text-white uppercase tracking-widest">Distributor Analysis Node</h4>
+                  </div>
+                  <div className="flex flex-col gap-1">
+                    <label className="text-[9px] uppercase font-black text-gray-500 ml-1">Distributor Name</label>
+                    <input type="text" value={form.distributor} onChange={e => updateForm('distributor', e.target.value)}
+                      className="bg-black/60 border border-white/10 rounded-xl px-4 py-2.5 text-white font-bold outline-none focus:border-[#00ff9f]/40"
+                      placeholder="e.g. Global Logistics A" />
+                  </div>
+                  <div className="grid grid-cols-2 gap-4">
+                    <div className="flex flex-col gap-1">
+                      <label className="text-[9px] uppercase font-black text-gray-500 ml-1">Distributor TDS</label>
+                      <input type="number" value={form.distTds} onChange={e => updateForm('distTds', e.target.value)}
+                        className="bg-black/60 border border-white/10 rounded-xl px-4 py-2.5 text-white font-bold outline-none focus:border-[#00ff9f]/40"
+                        placeholder="e.g. 225" />
+                    </div>
+                    <div className="flex flex-col gap-1">
+                      <label className="text-[9px] uppercase font-black text-gray-500 ml-1">Distributor Color</label>
+                      <input type="number" value={form.distColor} onChange={e => updateForm('distColor', e.target.value)}
+                        className="bg-black/60 border border-white/10 rounded-xl px-4 py-2.5 text-white font-bold outline-none focus:border-[#00ff9f]/40"
+                        placeholder="e.g. 195" />
+                    </div>
+                  </div>
+                </div>
+
+                <div className="flex flex-col justify-center items-center gap-4 border-l border-white/5 pl-6">
+                  <div className="text-center">
+                    <p className="text-[8px] font-black text-gray-600 uppercase tracking-widest mb-2">Live ESP32 Feed (Distributor)</p>
+                    <div className="flex gap-4">
+                      <div className="bg-black/40 px-4 py-2 rounded-xl border border-white/5">
+                        <p className="text-[10px] font-black text-[#00ff9f] italic">{esp32Live.connected ? esp32Live.tds : '--'}</p>
+                        <p className="text-[7px] text-gray-700 font-bold">TDS</p>
+                      </div>
+                      <div className="bg-black/40 px-4 py-2 rounded-xl border border-white/5">
+                        <p className="text-[10px] font-black text-[#00d1ff] italic">{esp32Live.connected ? esp32Live.color : '--'}</p>
+                        <p className="text-[7px] text-gray-700 font-bold">COLOR</p>
+                      </div>
+                    </div>
+                  </div>
+                  <div className="flex gap-2">
+                    <button onClick={() => syncWithEsp32('distributor')} disabled={!esp32Live.connected}
+                      className="px-4 py-2 rounded-xl border border-[#00ff9f]/20 text-[9px] font-black text-[#00ff9f] uppercase hover:bg-[#00ff9f]/10 transition-all disabled:opacity-30 flex items-center gap-2">
+                      <RefreshCw className="w-3 h-3" /> Sync Data
+                    </button>
+                    <button onClick={() => handleAnalyzeStage('distributor')} disabled={runningPipeline}
+                      className="px-4 py-2 rounded-xl font-black uppercase text-[9px] bg-[#00ff9f]/20 text-[#00ff9f] border border-[#00ff9f]/30 hover:bg-[#00ff9f] hover:text-black transition-all flex items-center gap-2">
+                      <Zap className="w-3 h-3" /> Analyze
+                    </button>
+                  </div>
+                </div>
+                {stageResults['distributor'] && (
+                  <div className="absolute -right-2 -top-2 w-6 h-6 rounded-full bg-[#00ff9f] flex items-center justify-center shadow-[0_0_15px_rgba(0,255,159,0.5)]">
+                    <CheckCircle2 className="w-4 h-4 text-black" />
+                  </div>
+                )}
+              </motion.div>
+            )}
+          </AnimatePresence>
+
+          {/* Row 4: Conditional Retailer (after Distributor) */}
+          <AnimatePresence>
+            {stageResults['distributor']?.status === 'safe' && (
+              <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }}
+                className="grid grid-cols-1 md:grid-cols-2 gap-6 bg-white/[0.02] p-6 rounded-2xl border border-white/5 relative group">
+                <div className="space-y-4">
+                  <div className="flex items-center gap-2">
+                    <Store className="w-4 h-4 text-[#00d1ff]" />
+                    <h4 className="text-[10px] font-black text-white uppercase tracking-widest">Retail Analysis Node</h4>
+                  </div>
+                  <div className="flex flex-col gap-1">
+                    <label className="text-[9px] uppercase font-black text-gray-500 ml-1">Retailer / Store Name</label>
+                    <input type="text" value={form.retailer} onChange={e => updateForm('retailer', e.target.value)}
+                      className="bg-black/60 border border-white/10 rounded-xl px-4 py-2.5 text-white font-bold outline-none focus:border-[#00d1ff]/40"
+                      placeholder="e.g. Fresh Mart Retail" />
+                  </div>
+                  <div className="grid grid-cols-2 gap-4">
+                    <div className="flex flex-col gap-1">
+                      <label className="text-[9px] uppercase font-black text-gray-500 ml-1">Retail TDS</label>
+                      <input type="number" value={form.retailTds} onChange={e => updateForm('retailTds', e.target.value)}
+                        className="bg-black/60 border border-white/10 rounded-xl px-4 py-2.5 text-white font-bold outline-none focus:border-[#00d1ff]/40"
+                        placeholder="e.g. 230" />
+                    </div>
+                    <div className="flex flex-col gap-1">
+                      <label className="text-[9px] uppercase font-black text-gray-500 ml-1">Retail Color</label>
+                      <input type="number" value={form.retailColor} onChange={e => updateForm('retailColor', e.target.value)}
+                        className="bg-black/60 border border-white/10 rounded-xl px-4 py-2.5 text-white font-bold outline-none focus:border-[#00d1ff]/40"
+                        placeholder="e.g. 190" />
+                    </div>
+                  </div>
+                </div>
+
+                <div className="flex flex-col justify-center items-center gap-4 border-l border-white/5 pl-6">
+                  <div className="text-center">
+                    <p className="text-[8px] font-black text-gray-600 uppercase tracking-widest mb-2">Live ESP32 Feed (Retail)</p>
+                    <div className="flex gap-4">
+                      <div className="bg-black/40 px-4 py-2 rounded-xl border border-white/5">
+                        <p className="text-[10px] font-black text-[#00ff9f] italic">{esp32Live.connected ? esp32Live.tds : '--'}</p>
+                        <p className="text-[7px] text-gray-700 font-bold">TDS</p>
+                      </div>
+                      <div className="bg-black/40 px-4 py-2 rounded-xl border border-white/5">
+                        <p className="text-[10px] font-black text-[#00d1ff] italic">{esp32Live.connected ? esp32Live.color : '--'}</p>
+                        <p className="text-[7px] text-gray-700 font-bold">COLOR</p>
+                      </div>
+                    </div>
+                  </div>
+                  <div className="flex gap-2">
+                    <button onClick={() => syncWithEsp32('retail')} disabled={!esp32Live.connected}
+                      className="px-4 py-2 rounded-xl border border-[#00d1ff]/20 text-[9px] font-black text-[#00d1ff] uppercase hover:bg-[#00d1ff]/10 transition-all disabled:opacity-30 flex items-center gap-2">
+                      <RefreshCw className="w-3 h-3" /> Sync Data
+                    </button>
+                    <button onClick={() => handleAnalyzeStage('retail')} disabled={runningPipeline}
+                      className="px-6 py-2 rounded-xl font-black uppercase text-[10px] bg-[#00d1ff]/20 text-[#00d1ff] border border-[#00d1ff]/30 hover:bg-[#00d1ff] hover:text-black transition-all flex items-center gap-2">
+                      <Zap className="w-3 h-3" /> Analyze
+                    </button>
+                  </div>
+                </div>
+                {stageResults['retail'] && (
+                  <div className="absolute -right-2 -top-2 w-6 h-6 rounded-full bg-[#00d1ff] flex items-center justify-center shadow-[0_0_15px_rgba(0,209,255,0.5)]">
+                    <CheckCircle2 className="w-4 h-4 text-black" />
+                  </div>
+                )}
+              </motion.div>
+            )}
+          </AnimatePresence>
+
+          {error && <p className="text-[#ff3b3b] text-[10px] font-black uppercase text-center">{error}</p>}
+
+          <div className="flex justify-center pt-2">
+            {hasData && !runningPipeline && (
+              <button onClick={handleReset}
+                className="px-12 py-3 rounded-2xl font-black uppercase tracking-widest text-[10px] border border-white/10 text-white hover:bg-white/5 transition-colors">
+                Reset Full Batch
+              </button>
+            )}
           </div>
         </GlassCard>
       </div>
 
-      {/* ── STAGE-BY-STAGE FLOW ── */}
+      {/* ── PIPELINE STAGE PROGRESS ── */}
       <div className="flex justify-center">
-        <div className="w-full max-w-5xl space-y-4">
+        <div className="w-full max-w-5xl space-y-3">
+          <div className="flex items-center gap-4">
+            <h2 className="text-xl font-black text-white uppercase italic tracking-tighter">Pipeline Progress</h2>
+            <div className="h-px flex-1 bg-white/10" />
+          </div>
 
-          {visibleStages.map((stage, idx) => {
-            const result = stageResults[stage];
-            const isActive = stage === activeInputStage;
-            const isUnsafe = result && result.status === 'unsafe';
-            const isSafe = result && result.status === 'safe';
-            const isRootCause = stage === rootCause;
+          <div className="space-y-3">
+            {STAGES.map((stage) => {
+              const result = stageResults[stage];
+              const isRunning = currentRunStage === stage;
+              const isUnsafe = result && result.status === 'unsafe';
+              const isSafe = result && result.status === 'safe';
+              const isBlocked = decision && decision !== 'ALLOW' && decision !== 'APPROVED_FOR_SALE' && result == null &&
+                rootCause && STAGES.indexOf(stage) > STAGES.indexOf(rootCause);
+              const isPending = !result && !isRunning && !isBlocked;
+              const Icon = STAGE_ICONS[stage] || Activity;
 
-            return (
-              <AnimatePresence key={stage}>
-                <motion.div
-                  initial={{ opacity: 0, y: 24 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  transition={{ duration: 0.4, delay: idx * 0.08 }}
-                >
-                  {/* ── Completed SAFE stage ── */}
-                  {isSafe && !isRootCause && (
-                    <div className="flex items-center gap-4 px-6 py-4 rounded-2xl bg-[#00ff9f]/5 border border-[#00ff9f]/20">
-                      <CheckCircle2 className="w-6 h-6 text-[#00ff9f] shrink-0" />
-                      <div className="flex-1">
-                        <span className="text-xs font-black text-[#00ff9f]/60 uppercase tracking-widest">{STAGE_ICONS_MAP[stage]} {STAGE_LABELS[stage]}</span>
-                        <p className="text-base font-black text-[#00ff9f] uppercase">SAFE — {result.reason}</p>
-                      </div>
-                      <Badge variant="safe" className="text-[9px] font-black uppercase">✓ Cleared</Badge>
-                      {idx < visibleStages.length - 1 && <ChevronRight className="w-4 h-4 text-[#00ff9f]/40" />}
-                    </div>
-                  )}
+              return (
+                <AnimatePresence key={stage}>
+                  <motion.div
+                    initial={{ opacity: 0, x: -20 }}
+                    animate={{ opacity: 1, x: 0 }}
+                    transition={{ duration: 0.4 }}
+                  >
+                    {/* Running Stage */}
+                    {isRunning && (
+                      <GlassCard className="border-[#00cfff]/40 bg-[#00cfff]/5 px-6 py-4">
+                        <div className="flex items-center gap-4">
+                          <div className="w-10 h-10 rounded-xl border-2 border-[#00cfff]/50 flex items-center justify-center text-[#00cfff]">
+                            <Icon className="w-5 h-5" />
+                          </div>
+                          <div className="flex-1">
+                            <p className="text-xs font-black text-[#00cfff] uppercase tracking-widest">
+                              Analyzing {STAGE_LABELS[stage]}...
+                            </p>
+                            <div className="mt-2 h-1 bg-white/10 rounded-full overflow-hidden">
+                              <motion.div
+                                className="h-full bg-[#00cfff] rounded-full"
+                                animate={{ width: ['0%', '100%'] }}
+                                transition={{ duration: 1.2, repeat: Infinity, ease: 'easeInOut' }}
+                              />
+                            </div>
+                          </div>
+                          <Badge variant="outline" className="text-[#00cfff] border-[#00cfff]/30 animate-pulse text-[9px]">
+                            PROCESSING
+                          </Badge>
+                        </div>
+                      </GlassCard>
+                    )}
 
-                  {/* ── Completed UNSAFE / root cause stage ── */}
-                  {(isUnsafe || isRootCause) && (
-                    <motion.div
-                      animate={{ scale: [1, 1.01, 1] }}
-                      transition={{ repeat: Infinity, duration: 2 }}
-                      className="px-6 py-5 rounded-2xl bg-[#ff3b3b]/10 border-2 border-[#ff3b3b]/40 shadow-[0_0_30px_rgba(255,59,59,0.15)]"
-                    >
-                      <div className="flex items-center gap-4">
-                        <AlertTriangle className="w-8 h-8 text-[#ff3b3b] animate-pulse shrink-0" />
+                    {/* Safe Stage */}
+                    {isSafe && !isUnsafe && (
+                      <motion.div
+                        initial={{ opacity: 0, scale: 0.97 }}
+                        animate={{ opacity: 1, scale: 1 }}
+                        className="flex items-center gap-4 px-6 py-4 rounded-xl bg-[#00ff9f]/5 border border-[#00ff9f]/25"
+                      >
+                        <CheckCircle2 className="w-6 h-6 text-[#00ff9f]" />
                         <div className="flex-1">
-                          <span className="text-[9px] font-black text-[#ff3b3b]/60 uppercase tracking-widest">{STAGE_ICONS_MAP[stage]} {STAGE_LABELS[stage]} — Root Cause</span>
-                          <p className="text-xl font-black text-[#ff3b3b] uppercase tracking-tight">
-                            Contamination Detected at {STAGE_LABELS[stage].toUpperCase()}
-                          </p>
-                          <p className="text-sm text-white/70 mt-1 font-bold">{result.reason}</p>
+                          <p className="text-sm font-black text-[#00ff9f] uppercase">{STAGE_LABELS[stage]} — Verified Safe</p>
+                          {result?.reason && <p className="text-[10px] text-white/50 mt-0.5">{result.reason}</p>}
                         </div>
-                        <Badge variant="unsafe" className="text-[9px] font-black uppercase animate-pulse">
-                          {decision?.replace(/_/g, ' ')}
-                        </Badge>
-                      </div>
-                      <p className="text-[10px] text-[#ff3b3b]/60 font-black uppercase mt-3 tracking-widest">
-                        ⛔ Supply flow stopped — all downstream stages blocked
-                      </p>
-                    </motion.div>
-                  )}
+                        <ChevronRight className="w-4 h-4 text-[#00ff9f]/30" />
+                      </motion.div>
+                    )}
 
-                  {/* ── Active input stage ── */}
-                  {isActive && (
-                    <GlassCard className="border-[#00ff9f]/20 bg-[#00ff9f]/5 shadow-[0_0_30px_rgba(0,255,159,0.05)]">
-                      <div className="flex flex-col gap-5 p-5">
-                        <div className="flex items-center gap-3">
-                          <div className="w-8 h-8 rounded-xl bg-[#00ff9f]/10 border border-[#00ff9f]/20 flex items-center justify-center text-sm">
-                            {STAGE_ICONS_MAP[stage]}
-                          </div>
-                          <div>
-                            <p className="text-[10px] text-[#00ff9f]/60 font-black uppercase tracking-widest">Next Stage</p>
-                            <h4 className="text-lg font-black text-white uppercase tracking-tight">{STAGE_LABELS[stage]} Analysis</h4>
-                          </div>
+                    {/* Unsafe / Root Cause Stage */}
+                    {isUnsafe && (
+                      <motion.div
+                        initial={{ opacity: 0, scale: 0.97 }}
+                        animate={{ opacity: 1, scale: 1 }}
+                        className="flex items-center gap-4 px-6 py-4 rounded-xl bg-[#ff3b3b]/10 border border-[#ff3b3b]/30"
+                      >
+                        <XCircle className="w-6 h-6 text-[#ff3b3b]" />
+                        <div className="flex-1">
+                          <p className="text-sm font-black text-[#ff3b3b] uppercase">{STAGE_LABELS[stage]} — Contaminated</p>
+                          {result?.reason && <p className="text-[10px] text-white/50 mt-0.5">{result.reason}</p>}
                         </div>
-                        <div className={cn("grid gap-4", stage === 'distributor' ? "grid-cols-1" : "grid-cols-2")}>
-                          {stage === 'distributor' && (
-                            <div className="flex flex-col gap-2">
-                              <label className="text-[10px] uppercase font-black text-[#00ff9f]/70 ml-1 flex items-center gap-2">
-                                <Truck className="w-3 h-3" /> Select Distributor
-                              </label>
-                              <select value={selectedDistributor} onChange={e => setInputs({ selectedDistributor: e.target.value })}
-                                className="bg-black/60 border border-white/10 rounded-xl px-4 py-3 text-white font-bold focus:border-[#00ff9f]/50 outline-none appearance-none cursor-pointer">
-                                <option value="" disabled className="bg-black">Choose Distributor</option>
-                                {['A','B','C','D','E'].map(c => <option key={c} value={`Distributor ${c}`} className="bg-black">Distributor {c}</option>)}
-                              </select>
-                            </div>
-                          )}
-                          <div className="grid grid-cols-2 gap-4">
-                            <div className="flex flex-col gap-2">
-                              <label className="text-[10px] uppercase font-black text-[#00ff9f]/70 ml-1 flex items-center gap-2">
-                                <Activity className="w-3 h-3" /> TDS Level (ppm)
-                              </label>
-                              <input type="number" value={stageInputs[stage]?.tds} onChange={e => updateStageInput(stage, 'tds', e.target.value)}
-                                className="bg-black/60 border border-white/10 rounded-xl px-4 py-3 text-white font-bold focus:border-[#00ff9f]/50 outline-none"
-                                placeholder="0.00" />
-                            </div>
-                            <div className="flex flex-col gap-2">
-                              <label className="text-[10px] uppercase font-black text-[#00ff9f]/70 ml-1 flex items-center gap-2">
-                                <Search className="w-3 h-3" /> Color Index
-                              </label>
-                              <input type="number" value={stageInputs[stage]?.color} onChange={e => updateStageInput(stage, 'color', e.target.value)}
-                                className="bg-black/60 border border-white/10 rounded-xl px-4 py-3 text-white font-bold focus:border-[#00ff9f]/50 outline-none"
-                                placeholder="0.00" />
-                            </div>
-                          </div>
-                        </div>
-                        <AnimatePresence>
-                          {error && <motion.p initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="text-[#ff3b3b] text-xs font-bold uppercase tracking-widest text-center">{error}</motion.p>}
-                        </AnimatePresence>
-                        <Button onClick={() => handleSubmitStage(stage)} disabled={isAnalyzing}
-                          className={cn("h-12 w-full rounded-xl font-black uppercase tracking-[0.2em] transition-all",
-                            isAnalyzing ? "opacity-50" : "bg-[#00ff9f] text-black hover:shadow-[0_0_30px_#00ff9f]")}>
-                          {isAnalyzing ? 'Analyzing...' : `Analyze ${STAGE_LABELS[stage]}`}
-                        </Button>
-                      </div>
-                    </GlassCard>
-                  )}
-                </motion.div>
-              </AnimatePresence>
-            );
-          })}
+                        <Badge variant="unsafe" className="ml-auto text-[8px]">ROOT CAUSE</Badge>
+                      </motion.div>
+                    )}
 
-          {/* All 4 stages complete and ALLOW */}
-          {decision === 'ALLOW' && batchHistory.length === 4 && (
-            <motion.div initial={{ opacity: 0, scale: 0.95 }} animate={{ opacity: 1, scale: 1 }}
-              className="px-8 py-6 rounded-2xl bg-[#00ff9f]/10 border-2 border-[#00ff9f]/30 shadow-[0_0_40px_rgba(0,255,159,0.15)] text-center">
-              <ShieldCheck className="w-12 h-12 text-[#00ff9f] mx-auto mb-3" />
-              <h2 className="text-2xl font-black text-[#00ff9f] uppercase tracking-tight">Full Pipeline Cleared</h2>
-              <p className="text-gray-400 text-sm mt-1 font-bold uppercase tracking-wide">All 4 stages verified safe — supply approved</p>
-            </motion.div>
-          )}
+                    {/* Blocked Stage */}
+                    {isBlocked && (
+                      <div className="flex items-center gap-4 px-6 py-4 rounded-xl bg-black/40 border border-white/5 opacity-40">
+                        <Ban className="w-6 h-6 text-gray-500" />
+                        <p className="text-sm font-black text-gray-500 uppercase">{STAGE_LABELS[stage]} — Blocked</p>
+                      </div>
+                    )}
+
+                    {/* Pending Stage */}
+                    {isPending && (
+                      <div className="flex items-center gap-4 px-6 py-4 rounded-xl bg-white/[0.03] border border-white/5 opacity-30">
+                        <Clock className="w-6 h-6 text-gray-600" />
+                        <p className="text-sm font-black text-gray-600 uppercase">{STAGE_LABELS[stage]} — Pending</p>
+                      </div>
+                    )}
+                  </motion.div>
+                </AnimatePresence>
+              );
+            })}
+          </div>
         </div>
       </div>
 
-      {/* ── ANALYTICS CARDS (shown after any submission) ── */}
+      {/* ── RESULTS: AI PREDICTION + RISK ── */}
       <AnimatePresence>
         {hasData && (
-          <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-8 relative">
-            <div className="absolute -inset-10 blur-[120px] pointer-events-none rounded-full opacity-10 z-0 transition-colors duration-1000"
-              style={{ background: `radial-gradient(circle, ${glow} 0%, transparent 70%)` }} />
-
-            {/* Sensor Metrics */}
-            <GlassCard className={cn("h-[300px] flex flex-col transition-all duration-700 relative z-10", cardBorder)}>
-              <div className="flex justify-between items-start mb-5">
-                <h3 className="text-xs font-black text-gray-500 uppercase tracking-widest flex items-center gap-2">
-                  <Activity className="w-4 h-4" style={{ color: glow }} /> Sensor Metrics
-                </h3>
-                <Badge variant={isCurSafe ? 'safe' : 'unsafe'}>Live</Badge>
-              </div>
-              <div className="space-y-4 flex-1">
-                <div>
-                  <div className="flex justify-between mb-1">
-                    <p className="text-[10px] text-gray-500 font-black uppercase">TDS Level</p>
-                    <span className={cn("text-[9px] font-black uppercase flex items-center gap-1", tdsOver ? "text-[#ff3b3b]" : "text-[#00ff9f]")}>
-                      {tdsOver ? <XCircle className="w-3 h-3" /> : <CheckCircle2 className="w-3 h-3" />} Limit {limits.tds}
-                    </span>
-                  </div>
-                  <p className={cn("text-4xl font-black tracking-tighter", tdsOver ? "text-[#ff3b3b]" : "text-white")}>
-                    <AnimatedNumber value={tdsVal} /> <span className="text-sm text-gray-500">ppm</span>
-                  </p>
-                  {tdsOver && <p className="text-[9px] text-[#ff3b3b] font-black uppercase">↑ {tdsVal - limits.tds} ppm over limit</p>}
-                </div>
-                <div>
-                  <div className="flex justify-between mb-1">
-                    <p className="text-[10px] text-gray-500 font-black uppercase">Color Index</p>
-                    <span className={cn("text-[9px] font-black uppercase flex items-center gap-1", colorOver ? "text-[#ff3b3b]" : "text-[#00ff9f]")}>
-                      {colorOver ? <XCircle className="w-3 h-3" /> : <CheckCircle2 className="w-3 h-3" />} Limit {limits.color}
-                    </span>
-                  </div>
-                  <p className={cn("text-4xl font-black tracking-tighter", colorOver ? "text-[#ff3b3b]" : "text-white")}>
-                    <AnimatedNumber value={colorVal} /> <span className="text-sm text-gray-500">unit</span>
-                  </p>
-                  {colorOver && <p className="text-[9px] text-[#ff3b3b] font-black uppercase">↓ {limits.color - colorVal} below limit</p>}
-                </div>
-              </div>
-            </GlassCard>
+          <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }}
+            className="grid grid-cols-1 md:grid-cols-2 gap-8 max-w-5xl mx-auto">
 
             {/* AI Prediction */}
-            <GlassCard className={cn("h-[300px] flex flex-col transition-all duration-700 relative z-10", cardBorder, batchIsUnsafe ? "bg-[#ff3b3b]/5" : "bg-[#00ff9f]/5")}>
-              <h3 className="text-xs font-black text-gray-500 uppercase tracking-widest flex items-center gap-2 mb-5">
-                <BrainCircuit className="w-4 h-4 text-[#00cfff]" /> AI Prediction
-              </h3>
-              <div className="flex flex-col items-center justify-center flex-1">
-                <h2 className="text-3xl font-black uppercase mb-4" style={{ color: glow2 }}>{aiResult.status}</h2>
-                <span className="text-5xl font-black text-white">
-                  <AnimatedNumber value={aiResult.confidence} /><span className="text-xl opacity-30">%</span>
-                </span>
-                <span className="text-[10px] text-[#00cfff] font-black uppercase tracking-widest mt-1">Confidence</span>
+            <GlassCard className={cn('p-8 flex flex-col justify-center items-center text-center space-y-4 border-2 transition-all duration-700',
+              isCurSafe ? 'border-[#00ff9f]/30 bg-[#00ff9f]/5' : 'border-[#ff3b3b]/30 bg-[#ff3b3b]/5')}>
+              <div className="flex items-center gap-2 mb-2">
+                <BrainCircuit className="w-5 h-5 text-[#00cfff]" />
+                <h3 className="text-xs font-black text-gray-500 uppercase tracking-widest">AI Prediction</h3>
               </div>
-              <div className="bg-black/40 p-3 rounded-xl border border-white/5">
-                <p className="text-[9px] text-gray-500 font-black uppercase mb-1">Reason</p>
-                <p className="text-xs font-bold text-white/90">{aiResult.reason}</p>
-              </div>
+              <h2 className="text-6xl font-black uppercase italic" style={{ color: isCurSafe ? '#00ff9f' : '#ff3b3b' }}>
+                {aiResult.status}
+              </h2>
+              <p className="text-sm font-bold text-white/70 max-w-[80%]">{aiResult.reason}</p>
             </GlassCard>
 
             {/* Risk Intelligence */}
-            <GlassCard className={cn("h-[300px] flex flex-col transition-all duration-700 relative z-10", cardBorder)}>
-              <h3 className="text-xs font-black text-gray-500 uppercase tracking-widest flex items-center gap-2 mb-5">
-                <Search className="w-4 h-4 text-[#fffb00]" /> Risk Intelligence
-              </h3>
-              <div className="flex-1 space-y-3 flex flex-col justify-center">
-                <div className="flex flex-col items-center">
-                  <Badge className="px-5 py-2 text-base mb-2" variant={aiResult.risk === 'HIGH' ? 'unsafe' : aiResult.risk === 'MEDIUM' ? 'warning' : 'safe'}>
-                    {aiResult.risk} RISK
-                  </Badge>
+            <GlassCard className="p-8 border-white/10 bg-white/[0.02] flex flex-col justify-between">
+              <div className="flex justify-between items-start mb-6">
+                <div className="flex items-center gap-2">
+                  <Search className="w-5 h-5 text-[#fffb00]" />
+                  <h3 className="text-xs font-black text-gray-500 uppercase tracking-widest">Risk Intelligence</h3>
                 </div>
-                <div className="bg-white/5 p-4 rounded-xl border border-white/5 space-y-2">
-                  <div className="flex justify-between text-[10px] font-black uppercase">
-                    <span className="text-gray-500">Stage</span>
-                    <span className="text-white">{useStore.getState().selectedStage || '—'}</span>
-                  </div>
-                  <div className="flex justify-between text-[10px] font-black uppercase">
-                    <span className="text-gray-500">Triggered By</span>
-                    <span className={cn("text-right max-w-[55%] leading-tight text-[9px]", isCurSafe ? "text-[#00ff9f]" : "text-[#ff3b3b]")}>{aiResult.reason}</span>
-                  </div>
+                <Badge variant={aiResult.risk === 'HIGH' ? 'unsafe' : aiResult.risk === 'MEDIUM' ? 'warning' : 'safe'}
+                  className="px-4 py-1 text-[10px] font-black">
+                  {aiResult.risk} RISK
+                </Badge>
+              </div>
+              <div className="space-y-6">
+                <div className="flex justify-between items-end border-b border-white/5 pb-4">
+                  <p className="text-[10px] text-gray-500 font-black uppercase">Last Stage</p>
+                  <p className="text-xl font-black text-white uppercase italic">{selectedStage || '—'}</p>
                 </div>
-                <div className="bg-white/5 p-3 rounded-xl border border-white/5">
-                  <p className="text-[9px] text-gray-500 font-black uppercase mb-1">Supplier Trust</p>
-                  <p className={cn("text-sm font-black", distributorInfo.score > 70 && isCurSafe ? "text-[#00ff9f]" : "text-[#ff3b3b]")}>
-                    {distributorInfo.score}% — {batchIsUnsafe ? 'COMPROMISED' : distributorInfo.status}
+                <div className="flex justify-between items-end border-b border-white/5 pb-4">
+                  <p className="text-[10px] text-gray-500 font-black uppercase">Distributor</p>
+                  <p className="text-xl font-black text-white uppercase italic truncate max-w-[60%]">
+                    {distributorInfo.name || form.distributor || '—'}
                   </p>
                 </div>
-              </div>
-            </GlassCard>
-
-            {/* Logistics Trace */}
-            <GlassCard className={cn("h-[300px] flex flex-col transition-all duration-700 relative z-10", cardBorder)}>
-              <h3 className="text-xs font-black text-gray-500 uppercase tracking-widest flex items-center gap-2 mb-5">
-                <MapPin className="w-4 h-4 text-[#7a5cff]" /> Logistics Trace
-              </h3>
-              <div className="flex-1 flex flex-col justify-center space-y-3">
-                <div className="bg-black/40 p-4 rounded-2xl border border-white/5 space-y-2">
-                  <div className="text-center">
-                    <p className="text-[10px] text-gray-500 font-black uppercase mb-1">Batch ID</p>
-                    <p className="text-base font-black text-white uppercase">{batchId || 'N/A'}</p>
-                  </div>
-                  {rootCause && (
-                    <div className="text-center">
-                      <p className="text-[10px] text-gray-500 font-black uppercase mb-1">Root Cause</p>
-                      <p className="text-base font-black text-[#ff3b3b] uppercase">{rootCause}</p>
-                    </div>
-                  )}
-                  <div className="flex items-center justify-center gap-2 mt-1">
-                    <div className="w-2 h-2 rounded-full animate-pulse" style={{ backgroundColor: glow }} />
-                    <span className="text-[10px] font-black text-gray-400 uppercase">{batchIsUnsafe ? 'COMPROMISED / ALERT' : 'ACTIVE / SECURE'}</span>
-                  </div>
+                <div className="flex justify-between items-end border-b border-white/5 pb-4">
+                  <p className="text-[10px] text-gray-500 font-black uppercase">Retailer</p>
+                  <p className="text-xl font-black text-white uppercase italic truncate max-w-[60%]">
+                    {retailerInfo?.name || form.retailer || '—'}
+                  </p>
                 </div>
-                <div className="space-y-1">
-                  <div className="flex justify-between text-[10px] font-black uppercase px-1">
-                    <span className="text-gray-500">Stages Done</span>
-                    <span style={{ color: glow }}>{batchHistory.length}/4</span>
-                  </div>
-                  <div className="h-1.5 w-full bg-white/5 rounded-full overflow-hidden">
-                    <motion.div animate={{ width: `${(batchHistory.length / 4) * 100}%` }} transition={{ duration: 0.8 }}
-                      className="h-full rounded-full" style={{ backgroundColor: glow }} />
-                  </div>
+                <div className="flex justify-between items-end border-b border-white/5 pb-4">
+                  <p className="text-[10px] text-gray-500 font-black uppercase">Flow Decision</p>
+                  <p className="text-xl font-black italic uppercase" style={{ color: glow }}>
+                    {decision?.replace(/_/g, ' ') || '—'}
+                  </p>
                 </div>
               </div>
             </GlassCard>
           </motion.div>
         )}
       </AnimatePresence>
+
+      {/* ── SENSOR METRICS (after run) ── */}
+      <AnimatePresence>
+        {hasData && (
+          <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }}
+            className="grid grid-cols-2 gap-6 max-w-5xl mx-auto">
+            {[
+              { label: 'TDS', value: tdsVal, unit: 'ppm', limit: limits.tds, over: tdsOver },
+              { label: 'Color', value: colorVal, unit: 'unit', limit: limits.color, over: colorOver },
+            ].map(({ label, value, unit, limit, over }) => (
+              <GlassCard key={label} className="p-5 border-white/10 bg-white/[0.02]">
+                <p className="text-[8px] font-black text-gray-500 uppercase tracking-widest mb-1">{label}</p>
+                <p className={cn('text-2xl font-black', over ? 'text-[#ff3b3b]' : 'text-white')}>
+                  {value} <span className="text-[10px] opacity-40">{unit}</span>
+                </p>
+                <p className="text-[8px] font-bold text-gray-600 mt-1">Limit {limit}</p>
+              </GlassCard>
+            ))}
+          </motion.div>
+        )}
+      </AnimatePresence>
+
     </div>
   );
 };

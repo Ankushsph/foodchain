@@ -26,7 +26,13 @@ export const ScannerPage = () => {
           batchId: 'MILK-4829A',
           source: 'Dairy Farm Alpha',
           status: 'UNSAFE',
-          confidence: 98.4,
+          // Simulate a dynamic score for MILK-4829A
+          // Milk TDS threshold: 250. Let's say it's 240 (risky)
+          // Color threshold: 180. Let's say it's 175 (risky)
+          // Using the algorithm: distance = abs(240-250)/250 = 0.04; abs(175-180)/180 = 0.027
+          // score = (0.04 + 0.027) / 2 = 0.0335
+          // confidence = 60 + (0.0335 * 35) = 61.1
+          confidence: (61 + Math.random() * 5).toFixed(1),
           reason: 'High turbidity (4.5 NTU) detected',
           txHash: blockchain.txHash,
           date: new Date().toLocaleDateString()

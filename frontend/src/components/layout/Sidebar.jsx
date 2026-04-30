@@ -1,14 +1,14 @@
 import React, { useState } from 'react';
 import { NavLink } from 'react-router-dom';
 import { motion } from 'framer-motion';
-import { ShieldCheck, Activity, Link as LinkIcon, AlertTriangle, BarChart3, ChevronLeft, ChevronRight } from 'lucide-react';
+import { ShieldCheck, Activity, Link as LinkIcon, AlertTriangle, BarChart3, ChevronLeft, ChevronRight, History } from 'lucide-react';
 import { cn } from '../ui/GlassCard';
 
 const navLinks = [
   { name: 'Dashboard', path: '/', icon: Activity },
   { name: 'Supply Chain', path: '/supply-chain', icon: LinkIcon },
   { name: 'Scan QR', path: '/scan', icon: ShieldCheck },
-  { name: 'Alerts', path: '/alerts', icon: AlertTriangle },
+  { name: 'Blockchain Audit', path: '/alerts', icon: History },
   { name: 'Analytics', path: '/analytics', icon: BarChart3 },
 ];
 

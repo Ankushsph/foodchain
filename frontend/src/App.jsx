@@ -7,7 +7,7 @@ import { Layout } from './components/layout/Layout';
 import { Dashboard } from './pages/Dashboard';
 import { SupplyChain } from './pages/SupplyChain';
 import { ScannerPage } from './pages/Scanner';
-import { Alerts } from './pages/Alerts';
+import { BlockchainAudit } from './pages/BlockchainAudit';
 import { Analytics } from './pages/Analytics';
 
 // Create a wrapper component for AnimatePresence
@@ -21,7 +21,7 @@ const AnimatedRoutes = () => {
           <Route index element={<Dashboard />} />
           <Route path="supply-chain" element={<SupplyChain />} />
           <Route path="scan" element={<ScannerPage />} />
-          <Route path="alerts" element={<Alerts />} />
+          <Route path="alerts" element={<BlockchainAudit />} />
           <Route path="analytics" element={<Analytics />} />
         </Route>
       </Routes>
