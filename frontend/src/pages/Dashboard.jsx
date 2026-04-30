@@ -1,5 +1,6 @@
 import React, { useEffect, useState, useMemo, useRef } from 'react';
 import { motion, useMotionValue, useTransform, animate, AnimatePresence } from 'framer-motion';
+import toast from 'react-hot-toast';
 import {
   ShieldCheck, Activity, BrainCircuit, AlertTriangle, Search,
   CheckCircle2, XCircle, Clock, Ban, Leaf, Truck, Store, ChevronRight, Zap, RefreshCw
@@ -34,8 +35,10 @@ export const Dashboard = () => {
   // Single-form inputs for the whole batch
   const [form, setForm] = useState({
     tds: '', color: '',
+    farmerName: '',
     distributor: '', distTds: '', distColor: '',
-    retailer: '', retailTds: '', retailColor: ''
+    retailer: '', retailTds: '', retailColor: '',
+    walletKey: ''
   });
 
   const updateForm = (field, val) => setForm(prev => ({ ...prev, [field]: val }));
@@ -47,7 +50,7 @@ export const Dashboard = () => {
   }, [batchHistory]);
 
   const limits = PRODUCT_LIMITS[selectedProduct] || PRODUCT_LIMITS.default;
-  const batchIsUnsafe = hasData && decision && decision !== 'ALLOW';
+  const batchIsUnsafe = hasData && decision === 'BLOCK_BATCH';
   const glow = !hasData ? '#4b5563' : batchIsUnsafe ? '#ff3b3b' : '#00ff9f';
   const isCurSafe = aiResult.status === 'SAFE';
 
@@ -66,8 +69,34 @@ export const Dashboard = () => {
     // Pick values based on stage
     const finalTds = (stage === 'farm' ? form.tds : stage === 'distributor' ? form.distTds : form.retailTds) || '220';
     const finalColor = (stage === 'farm' ? form.color : stage === 'distributor' ? form.distColor : form.retailColor) || '200';
-    const finalDist = form.distributor || 'Distributor A';
-    const finalRet = form.retailer || 'Retail Center 1';
+    const finalDist = form.distributor;
+    const finalRet = form.retailer;
+
+    // Field Validation
+    if (!form.walletKey) {
+      toast.error("ENTER WALLET KEY TO VERIFY IDENTITY");
+      return;
+    }
+
+    if (stage === 'farm') {
+      if (!batchId && !form.tds) { // Allow blank batchId if it's the very first entry (it will auto-gen)
+         // but we need farmerName and sensor values
+      }
+      if (!form.farmerName || !form.tds || !form.color) {
+        toast.error("ENTER ALL FIELDS FOR FARM STAGE");
+        return;
+      }
+    } else if (stage === 'distributor') {
+      if (!form.distributor || !form.distTds || !form.distColor) {
+        toast.error("ENTER ALL FIELDS FOR DISTRIBUTOR STAGE");
+        return;
+      }
+    } else if (stage === 'retail') {
+      if (!form.retailer || !form.retailTds || !form.retailColor) {
+        toast.error("ENTER ALL FIELDS FOR RETAIL STAGE");
+        return;
+      }
+    }
 
     setError('');
     setRunningPipeline(true);
@@ -85,15 +114,22 @@ export const Dashboard = () => {
     });
 
     try {
-      await fetchAiAnalysis({
+      const result = await fetchAiAnalysis({
         batch_id: finalBatchId,
         stage,
         tds: Number(finalTds),
         color: Number(finalColor),
         product: finalProduct,
         distributor: finalDist,
-        retailer: finalRet
+        retailer: finalRet,
+        farmer_name: form.farmerName,
+        wallet_key: form.walletKey
       });
+
+      if (result && result.registered_key && result.registered_key !== form.walletKey) {
+        updateForm('walletKey', result.registered_key);
+        toast.success(`NEW IDENTITY REGISTERED! KEY: ${result.registered_key}`, { duration: 8000 });
+      }
     } catch (err) {
       setError(err.message);
     } finally {
@@ -119,12 +155,14 @@ export const Dashboard = () => {
     setCurrentRunStage(null);
     setForm({
       tds: '', color: '',
+      farmerName: '',
       distributor: '', distTds: '', distColor: '',
-      retailer: '', retailTds: '', retailColor: ''
+      retailer: '', retailTds: '', retailColor: '',
+      walletKey: ''
     });
 
     try {
-      await fetch("http://127.0.0.1:8000/reset", { method: "POST" });
+      await fetch("http://127.0.0.1:8008/reset", { method: "POST" });
     } catch (e) {
       console.error("Failed to reset backend:", e);
     }
@@ -248,6 +286,33 @@ export const Dashboard = () => {
             </div>
           </div>
 
+          {/* 🔐 UNIVERSAL IDENTITY LOCK */}
+          <GlassCard className="p-6 border-[#00cfff]/30 bg-[#00cfff]/5 mb-8">
+            <div className="flex items-center justify-between gap-6 flex-wrap md:flex-nowrap">
+              <div className="flex items-center gap-4">
+                <div className="p-3 bg-[#00cfff]/10 rounded-xl border border-[#00cfff]/30 shadow-[0_0_15px_rgba(0,207,255,0.2)]">
+                  <ShieldCheck className="w-5 h-5 text-[#00cfff]" />
+                </div>
+                <div>
+                  <h4 className="text-[10px] font-black text-[#00cfff] uppercase tracking-[0.2em] mb-1 italic">Identity Verification Protocol</h4>
+                  <p className="text-[14px] font-black text-white uppercase italic tracking-tight">Active Actor Passkey Required</p>
+                </div>
+              </div>
+              <div className="flex-1 max-w-md w-full">
+                <input 
+                  type="text" 
+                  placeholder="ENTER PRIVATE WALLET KEY (VERIFIES IDENTITY)"
+                  value={form.walletKey}
+                  onChange={(e) => updateForm('walletKey', e.target.value.toUpperCase())}
+                  className="w-full bg-black/60 border border-white/10 rounded-xl px-4 py-3 text-xs font-mono text-[#00cfff] placeholder:text-gray-600 focus:border-[#00cfff]/50 transition-all outline-none text-center tracking-[0.3em]"
+                />
+              </div>
+            </div>
+            <p className="text-[9px] text-gray-600 mt-4 text-center font-bold tracking-widest uppercase italic">
+              * First-time users: This key will be registered to your name permanently on the blockchain.
+            </p>
+          </GlassCard>
+
           {/* Row 2: Initial Sensor Values (Always Visible) */}
           <div className="grid grid-cols-1 md:grid-cols-2 gap-6 bg-white/[0.02] p-6 rounded-2xl border border-white/5 relative group">
             <div className="space-y-4">
@@ -256,6 +321,12 @@ export const Dashboard = () => {
                 <h4 className="text-[10px] font-black text-white uppercase tracking-widest">Farm Analysis Node</h4>
               </div>
               <div className="grid grid-cols-2 gap-4">
+                <div className="col-span-2 flex flex-col gap-1">
+                  <label className="text-[9px] uppercase font-black text-gray-500 ml-1 italic">Agricultural Source (Farm Name)</label>
+                  <input type="text" value={form.farmerName} onChange={e => updateForm('farmerName', e.target.value)}
+                    className="bg-black/60 border border-white/10 rounded-xl px-4 py-2.5 text-white font-bold outline-none focus:border-[#00ff9f]/40"
+                    placeholder="ENTER FARM NAME" />
+                </div>
                 <div className="flex flex-col gap-1">
                   <label className="text-[9px] uppercase font-black text-gray-500 ml-1">Farm TDS (ppm)</label>
                   <input type="number" value={form.tds} onChange={e => updateForm('tds', e.target.value)}
