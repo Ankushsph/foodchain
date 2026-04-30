@@ -8,7 +8,7 @@ import hashlib
 import json
 import os
 from dotenv import load_dotenv
-from stellar_sdk import Server, Keypair, TransactionBuilder, Network, Memo
+from stellar_sdk import Server, Keypair, TransactionBuilder, Network, TextMemo
 from ai.food_chain_ai import ai_system
 
 load_dotenv()
@@ -69,7 +69,7 @@ def post_to_stellar(data_to_hash: dict):
                 amount="0.00001",
                 asset=StellarAsset.native(),
             )
-            .add_memo(Memo.text(data_hash[:28]))
+            .add_memo(TextMemo(data_hash[:28]))
             .set_timeout(30)
             .build()
         )
@@ -99,11 +99,12 @@ class Sample(BaseModel):
 # SIMPLE ANALYSIS LOGIC
 # =========================
 def analyze_sample(sample: Sample):
-    # Use the advanced AI model
+    # Use the advanced AI model with product-specific analysis
     result = ai_system.analyze_sample({
         "tds": sample.tds,
         "color": sample.color,
-        "source": sample.stage
+        "source": sample.stage,
+        "product_type": sample.product  # Pass product type for specific analysis
     })
     
     # Map AI results to our local structure
@@ -119,6 +120,12 @@ def analyze_sample(sample: Sample):
 @app.get("/")
 def home():
     return {"msg": "FoodChain AI Phase 2 Backend Running"}
+
+@app.get("/favicon.ico")
+async def favicon():
+    """Return 204 No Content for favicon requests to avoid 404 errors"""
+    from fastapi.responses import Response
+    return Response(status_code=204)
 
 STAGES = ["farm", "distributor", "retail"]
 

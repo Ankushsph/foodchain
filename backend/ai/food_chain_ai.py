@@ -16,18 +16,54 @@ class FoodChainAI:
         self.history = []
         self.sources = ["Farm A", "Distributor A", "Retail A", "Storage Unit 4"]
         
-        # Initialize Model
-        training_data = self._generate_training_data()
-        self.model = self._train_model(training_data)
+        # Product-specific quality standards
+        self.product_standards = {
+            "water": {
+                "name": "Mineral Water",
+                "tds_safe_max": 200,  # Stricter: pure water should be <200
+                "tds_acceptable_max": 300,  # Reduced from 500
+                "color_min": 150,  # Stricter: water should be very clear
+                "color_warning": 120,
+                "training_tds": (50, 200),  # Narrower training range
+                "training_color": (150, 255)  # Higher color values only
+            },
+            "milk": {
+                "name": "Fresh Milk",
+                "tds_safe_max": 280,
+                "tds_acceptable_max": 350,
+                "color_min": 160,
+                "color_warning": 140,
+                "training_tds": (200, 300),
+                "training_color": (160, 255)
+            },
+            "juice": {
+                "name": "Fruit Juice",
+                "tds_safe_max": 400,
+                "tds_acceptable_max": 600,
+                "color_min": 120,
+                "color_warning": 100,
+                "training_tds": (150, 450),
+                "training_color": (120, 255)
+            }
+        }
+        
+        # Initialize Models for each product type
+        self.models = {}
+        for product_type, standards in self.product_standards.items():
+            training_data = self._generate_training_data(
+                standards["training_tds"],
+                standards["training_color"]
+            )
+            self.models[product_type] = self._train_model(training_data)
         
         # Pre-seed history with mock data for testing
         self._seed_history(50)
 
-    def _generate_training_data(self, n_samples=300):
-        """Generates synthetic 'normal' data."""
+    def _generate_training_data(self, tds_range, color_range, n_samples=300):
+        """Generates synthetic 'normal' data for specific product type."""
         np.random.seed(42)
-        tds = np.random.uniform(100, 300, n_samples)
-        color = np.random.uniform(150, 255, n_samples)
+        tds = np.random.uniform(tds_range[0], tds_range[1], n_samples)
+        color = np.random.uniform(color_range[0], color_range[1], n_samples)
         return pd.DataFrame({'tds': tds, 'color': color})
 
     def _train_model(self, data):
@@ -38,25 +74,33 @@ class FoodChainAI:
 
     def _seed_history(self, n):
         """Pre-seeds the history with simulated safe and unsafe data."""
+        product_types = list(self.product_standards.keys())
+        
         for i in range(n):
+            product_type = random.choice(product_types)
+            standards = self.product_standards[product_type]
+            
             # 80% safe, 20% unsafe
             is_anomaly = random.random() < 0.2
             if is_anomaly:
-                tds = random.uniform(400, 600) if random.random() > 0.5 else random.uniform(100, 300)
-                color = random.uniform(50, 130) if random.random() > 0.5 else random.uniform(150, 255)
+                # Unsafe: exceed limits
+                tds = random.uniform(standards["tds_acceptable_max"], standards["tds_acceptable_max"] + 200)
+                color = random.uniform(30, standards["color_warning"])
             else:
-                tds = random.uniform(150, 280)
-                color = random.uniform(180, 240)
+                # Safe: within normal range
+                tds = random.uniform(standards["training_tds"][0], standards["tds_safe_max"])
+                color = random.uniform(standards["color_min"], standards["training_color"][1])
             
-            # Predict status
+            # Predict status using product-specific model
             sample_df = pd.DataFrame([[tds, color]], columns=['tds', 'color'])
-            prediction = self.model.predict(sample_df)[0]
+            prediction = self.models[product_type].predict(sample_df)[0]
             status = "safe" if prediction == 1 else "unsafe"
             
             self.history.append({
                 "tds": round(tds, 2),
                 "color": round(color, 2),
                 "status": status,
+                "product_type": product_type,
                 "source": random.choice(self.sources),
                 "timestamp": (datetime.now() - timedelta(hours=n-i)).isoformat()
             })
@@ -142,29 +186,60 @@ class FoodChainAI:
         return {"pattern": "Random Anomalies", "insight": "No clear recurring source for recent issues"}
 
     def analyze_sample(self, data):
-        """Phase 2 Analysis: Detection + Intelligence."""
+        """Phase 2 Analysis: Detection + Intelligence with product-specific standards."""
         tds = data.get('tds', 0)
         color = data.get('color', 0)
         source = data.get('source', random.choice(self.sources))
+        product_type = data.get('product_type', 'water')  # Default to water
+        
+        # Normalize product type
+        product_type = product_type.lower()
+        if product_type not in self.product_standards:
+            product_type = 'water'  # Fallback
+        
+        standards = self.product_standards[product_type]
+        model = self.models[product_type]
         
         sample_df = pd.DataFrame([[tds, color]], columns=['tds', 'color'])
         
-        # 1. Core Detection
-        prediction = self.model.predict(sample_df)[0]
+        # 1. Core Detection using product-specific model
+        prediction = model.predict(sample_df)[0]
         status = "safe" if prediction == 1 else "unsafe"
         
-        # 2. Reasoning
+        # 2. Product-specific Reasoning
         reasons = []
-        if tds > 400: reasons.append(f"High dissolved solids (TDS={tds} ppm)")
-        if color < 140: reasons.append(f"Abnormal color detected (value={color})")
+        
+        if product_type == "water":
+            if tds > standards["tds_acceptable_max"]:
+                reasons.append(f"High TDS ({tds} ppm, limit: {standards['tds_acceptable_max']})")
+            elif tds > standards["tds_safe_max"]:
+                reasons.append(f"Elevated TDS ({tds} ppm, pure water should be <{standards['tds_safe_max']})")
+            if color < standards["color_min"]:
+                reasons.append(f"Poor water clarity (color={color}, expected: >{standards['color_min']})")
+            elif color < standards["color_warning"]:
+                reasons.append(f"Water clarity warning (color={color})")
+                
+        elif product_type == "milk":
+            if tds > standards["tds_acceptable_max"]:
+                reasons.append(f"Possible water adulteration (TDS={tds} ppm, normal: <{standards['tds_safe_max']})")
+            elif tds < 200:
+                reasons.append(f"Possible dilution (TDS={tds} ppm too low)")
+            if color < standards["color_warning"]:
+                reasons.append(f"Abnormal milk color (value={color}, expected: >{standards['color_min']})")
+                
+        elif product_type == "juice":
+            if tds > standards["tds_acceptable_max"]:
+                reasons.append(f"Excessive dissolved solids (TDS={tds} ppm, max: {standards['tds_acceptable_max']})")
+            if color < standards["color_warning"]:
+                reasons.append(f"Color deviation detected (value={color}, expected: >{standards['color_min']})")
         
         if not reasons and status == "unsafe":
-            reasons.append("Anomalous sensor pattern detected by AI model")
+            reasons.append(f"Anomalous sensor pattern detected by AI model for {standards['name']}")
         
-        reason = " and ".join(reasons) if reasons else "All parameters within optimal safety range"
+        reason = " and ".join(reasons) if reasons else f"All parameters within safe {standards['name']} standards"
         
         # 3. Confidence
-        raw_score = self.model.decision_function(sample_df)[0]
+        raw_score = model.decision_function(sample_df)[0]
         confidence = 0.5 + min(0.49, abs(raw_score) * 5)
         
         # 4. Save to History
@@ -172,6 +247,7 @@ class FoodChainAI:
             "tds": tds,
             "color": color,
             "status": status,
+            "product_type": product_type,
             "source": source,
             "timestamp": datetime.now().isoformat()
         })
@@ -190,7 +266,8 @@ class FoodChainAI:
             "risk": prediction_risk['risk_level'],
             "reason": reason,
             "source": source,
-            "interpretation": "Possible contamination detected" if status == "unsafe" else "Safe for consumption",
+            "product_type": standards['name'],
+            "interpretation": f"Possible contamination detected in {standards['name']}" if status == "unsafe" else f"{standards['name']} is safe for consumption",
             
             # Phase 2 Fields
             "trend": trend['message'],
