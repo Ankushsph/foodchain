@@ -18,10 +18,10 @@ export const STAGE_ACTORS = {
 
 // TDS / Color safety thresholds per product (for sensor card limit display)
 export const PRODUCT_LIMITS = {
-  milk:       { tds: 250, color: 160 },
-  water:      { tds: 300, color: 200 },
-  juice:      { tds: 300, color: 150 },
-  default:    { tds: 300, color: 150 },
+  milk: { tds: 250, color: 160 },
+  water: { tds: 300, color: 200 },
+  juice: { tds: 300, color: 150 },
+  default: { tds: 300, color: 150 },
 };
 
 // Build default supplyChain with all 4 stages as PENDING
@@ -86,6 +86,16 @@ const useStore = create((set, get) => ({
   // Reason text belonging to the ROOT CAUSE stage (not the current stage)
   rootCauseReason: "",
 
+  isAnalyticsLoading: true,
+  analytics: {
+    stats: { total: 0, unsafe: 0, risk_pct: 0, current_status: 'SAFE' },
+    farmers: [],
+    distributors: [],
+    retailers: [],
+    blacklisted: [],
+    trends: []
+  },
+
   // ── Supply Chain (4 stages, always rendered) ─────────────────
   supplyChain: defaultSupplyChain,
 
@@ -119,9 +129,9 @@ const useStore = create((set, get) => ({
 
     const poll = async () => {
       try {
-        const res = await fetch("http://127.0.0.1:8000/live");
+        const res = await fetch("http://127.0.0.1:8008/live");
         const json = await res.json();
-        
+
         if (json.connected) {
           set({
             esp32Live: {
@@ -140,7 +150,7 @@ const useStore = create((set, get) => ({
           const batchHistoryRaw = fullBatch.batch_history;
           const rootCause = fullBatch.root_cause;
           const decision = fullBatch.decision;
-          
+
           const historyMap = {};
           batchHistoryRaw.forEach((entry) => {
             if (entry && entry.stage) historyMap[entry.stage] = entry;
@@ -210,12 +220,12 @@ const useStore = create((set, get) => ({
     // Only mark isAnalyzing — do NOT reset hasData (keeps previous pipeline visible)
     set({ isAnalyzing: true });
     try {
-      const response = await fetch("http://127.0.0.1:8000/analyze", {
+      const response = await fetch("http://127.0.0.1:8008/analyze", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(inputData),
       });
-      
+
       if (!response.ok) {
         const errorData = await response.json().catch(() => ({}));
         throw new Error(errorData.detail?.[0]?.msg || errorData.message || "Backend Analysis Failed");
@@ -223,8 +233,14 @@ const useStore = create((set, get) => ({
 
       const data = await response.json();
 
+      if (data && data.status === 'BLOCKED') {
+        toast.error(data.reason || "Submission blocked");
+        set({ isAnalyzing: false });
+        return data;
+      }
+
       if (data && data.current_stage_result) {
-        // Always uppercase for consistent comparisons
+
         const rawStatus = data.current_stage_result.status || "safe";
         const aiStatus = rawStatus.toUpperCase();
 
@@ -245,8 +261,13 @@ const useStore = create((set, get) => ({
         else if (decision === "STOP_SUPPLY") alertMsg = `Supply halted at ${rootCause?.toUpperCase()} stage`;
         else if (decision === "REJECT_AT_RETAIL") alertMsg = "Batch rejected at retail gate";
         else if (decision === "APPROVED_FOR_SALE") alertMsg = "Batch fully verified for distribution";
+        else if (decision === "ALLOW_WITH_WARNING") alertMsg = "⚠️ Safe batch from low-reputation supplier";
 
         const rootCauseReason = rootCauseEntry ? rootCauseEntry.reason : alertMsg;
+
+        if (data.recall_triggered) {
+          toast.error(`🚨 RECALL: ${data.recall_batches.length} related batches identified`, { duration: 6000 });
+        }
 
         const newSupplyChain = STAGES.map((stage, idx) => {
           const entry = historyMap[stage];
@@ -319,6 +340,7 @@ const useStore = create((set, get) => ({
           },
         });
         toast.success(`${STAGE_LABELS[data.current_stage_result.stage] || 'Stage'} Analyzed`);
+        return data;
       } else {
         throw new Error("Invalid response format from AI backend");
       }
@@ -333,14 +355,38 @@ const useStore = create((set, get) => ({
   // ⛓️ Dispute Verification Action
   verifyBatch: async (batchId) => {
     try {
-      const response = await fetch(`http://127.0.0.1:8000/verify/${batchId}`);
+      const response = await fetch(`http://127.0.0.1:8008/verify/${batchId}`);
       if (!response.ok) throw new Error("Verification failed");
       const data = await response.json();
+
+      if (data.events) {
+        // Update global state so Live Network Events and other components see this batch
+        set({
+          batchHistory: data.events,
+          batchId: data.batch_id,
+          hasData: true,
+          decision: data.status === 'UNSAFE' ? 'BLOCK_BATCH' : 'APPROVED_FOR_SALE',
+          rootCause: data.root_cause
+        });
+      }
+
       return data;
     } catch (error) {
       console.error("Verification failed:", error);
       toast.error("Batch verification failed");
       return null;
+    }
+  },
+
+  fetchAnalytics: async () => {
+    set({ isAnalyticsLoading: true });
+    try {
+      const response = await fetch('http://127.0.0.1:8008/analytics');
+      const data = await response.json();
+      set({ analytics: data, isAnalyticsLoading: false });
+    } catch (error) {
+      console.error("Failed to fetch analytics:", error);
+      set({ isAnalyticsLoading: false });
     }
   },
 }));

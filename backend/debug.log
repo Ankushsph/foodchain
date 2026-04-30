@@ -1,0 +1,5 @@
+[AUTH CHECK] Name: 'abc' | Provided: 'SHA123' | DB Result: None
+[AUTH NEW] Registered 'abc' with key 'SHA123'
+[AUTH CHECK] Name: 'bang' | Provided: 'SH' | DB Result: None
+[AUTH NEW] Registered 'bang' with key 'SH'
+[AUTH CHECK] Name: 'bang' | Provided: 'SHH' | DB Result: ('SH',)
