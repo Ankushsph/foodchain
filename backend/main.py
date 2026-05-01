@@ -54,7 +54,44 @@ def init_db():
     conn.commit()
     conn.close()
 
+def seed_demo_data():
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    # Check if MILK-001 already exists
+    cursor.execute('SELECT COUNT(*) FROM batch_history WHERE batch_id = "MILK-001"')
+    if cursor.fetchone()[0] == 0:
+        # Create a perfect safe batch history
+        stages = [
+            ("farm", "Agricultural Source", "safe", "High quality fresh milk collected", 98),
+            ("distributor", "Logistics Node", "safe", "Maintained constant 4°C during transit", 95),
+            ("retail", "Retail Center", "safe", "Verified safe for shelf display", 92)
+        ]
+        
+        for stage, actor, status, reason, score in stages:
+            # Seed actor reputation if needed
+            cursor.execute('INSERT OR IGNORE INTO actor_reputation (name, type, score, status, wallet_id) VALUES (?, ?, ?, ?, ?)',
+                          (actor, stage, score, 'TRUSTED', f"G{hashlib.sha256(actor.encode()).hexdigest()[:24].upper()}"))
+            
+            entry = {
+                "stage": stage,
+                "actor": actor,
+                "status": status,
+                "risk": "LOW",
+                "reason": reason,
+                "tds": 220,
+                "color": 210,
+                "batch_id": "MILK-001",
+                "timestamp": datetime.now().isoformat(),
+                "blockchain_hash": f"stellar_tx_{random.getrandbits(64):016x}",
+                "product": "Premium Whole Milk"
+            }
+            cursor.execute('INSERT INTO batch_history (batch_id, stage, data) VALUES (?, ?, ?)', 
+                          ("MILK-001", stage, json.dumps(entry)))
+        conn.commit()
+    conn.close()
+
 init_db()
+seed_demo_data()
 
 def update_actor_score(name, actor_type, delta):
     conn = sqlite3.connect(DB_PATH)
@@ -315,6 +352,7 @@ def reset_system():
     cursor.execute('DELETE FROM batch_history')
     conn.commit()
     conn.close()
+    seed_demo_data()
     return {"msg": "System reset complete"}
 
 @app.get("/live")
@@ -337,11 +375,47 @@ async def update_esp32(data: dict):
 @app.get("/verify/{batch_id}")
 def verify_batch(batch_id: str):
     history = load_batch_from_db(batch_id)
-    if not history: return {"error": "Batch not found"}
+    if not history:
+        return {"error": "Batch not found", "status": "NOT_FOUND", "events": []}
+    
+    # Sort by stage order
     history.sort(key=lambda x: STAGES.index(x["stage"]))
-    root_cause = next((e["stage"] for e in history if e["status"] == "unsafe"), None)
+    
+    # Identify root cause and decision
+    root_cause = None
+    verdict = "Batch Fully Verified - No issues detected"
+    responsible_actor = None
+    product = history[0].get("product", "Food Product") if history else "Unknown"
+    
+    events_with_rep = []
+    for e in history:
+        status_str, score, wallet = get_actor_status(e["actor"])
+        if e["status"] == "unsafe" and not root_cause:
+            root_cause = e["stage"]
+            responsible_actor = e["actor"]
+            verdict = f"{responsible_actor} is responsible for contamination"
+            
+        events_with_rep.append({
+            "stage": e["stage"],
+            "actor": e["actor"],
+            "status": e["status"],
+            "timestamp": e["timestamp"],
+            "event_hash": hashlib.sha256(f"{batch_id}{e['stage']}{e['status']}{e['timestamp']}".encode()).hexdigest(),
+            "blockchain_hash": e.get("blockchain_hash"),
+            "actor_score": score,
+            "actor_status": status_str
+        })
+            
+    decision = "NOT SAFE" if root_cause else "VERIFIED SAFE"
+
     return {
-        "batch_id": batch_id, "events": history, "root_cause": root_cause,
-        "verdict": "Contamination Detected" if root_cause else "Batch Fully Verified",
-        "status": "UNSAFE" if root_cause else "SAFE"
+        "batch_id": batch_id,
+        "product": product,
+        "events": events_with_rep,
+        "root_cause": root_cause,
+        "responsible_actor": responsible_actor,
+        "verdict": verdict,
+        "total_checkpoints": len(history),
+        "status": "UNSAFE" if root_cause else "SAFE",
+        "decision": decision
     }
