@@ -162,7 +162,7 @@ export const Dashboard = () => {
     });
 
     try {
-      await fetch("http://127.0.0.1:8008/reset", { method: "POST" });
+      await fetch("http://127.0.0.1:8000/reset", { method: "POST" });
     } catch (e) {
       console.error("Failed to reset backend:", e);
     }

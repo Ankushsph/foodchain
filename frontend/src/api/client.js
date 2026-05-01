@@ -1,7 +1,7 @@
 import axios from 'axios';
 
-// Mock API base URL - replace with actual backend URL later
-const API_BASE_URL = 'http://localhost:8008';
+// API base URL - backend is on port 8000
+const API_BASE_URL = 'http://localhost:8000';
 
 const apiClient = axios.create({
   baseURL: API_BASE_URL,

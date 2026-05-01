@@ -129,7 +129,7 @@ const useStore = create((set, get) => ({
 
     const poll = async () => {
       try {
-        const res = await fetch("http://127.0.0.1:8008/live");
+        const res = await fetch("http://127.0.0.1:8000/live");
         const json = await res.json();
 
         if (json.connected) {
@@ -220,7 +220,7 @@ const useStore = create((set, get) => ({
     // Only mark isAnalyzing — do NOT reset hasData (keeps previous pipeline visible)
     set({ isAnalyzing: true });
     try {
-      const response = await fetch("http://127.0.0.1:8008/analyze", {
+      const response = await fetch("http://127.0.0.1:8000/analyze", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(inputData),
@@ -355,7 +355,7 @@ const useStore = create((set, get) => ({
   // ⛓️ Dispute Verification Action
   verifyBatch: async (batchId) => {
     try {
-      const response = await fetch(`http://127.0.0.1:8008/verify/${batchId}`);
+      const response = await fetch(`http://127.0.0.1:8000/verify/${batchId}`);
       if (!response.ok) throw new Error("Verification failed");
       const data = await response.json();
 
@@ -381,7 +381,7 @@ const useStore = create((set, get) => ({
   fetchAnalytics: async () => {
     set({ isAnalyticsLoading: true });
     try {
-      const response = await fetch('http://127.0.0.1:8008/analytics');
+      const response = await fetch('http://127.0.0.1:8000/analytics');
       const data = await response.json();
       set({ analytics: data, isAnalyticsLoading: false });
     } catch (error) {
